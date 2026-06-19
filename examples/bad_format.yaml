@@ -1,0 +1,10 @@
+schema_version: "1.0"
+switches:
+  - env: prod
+    name: broken_syntax
+    author: alice@local
+    rollout_ratio: 50
+    whitelist:
+      - unclosed:
+        - nested: [
+    default_value: true

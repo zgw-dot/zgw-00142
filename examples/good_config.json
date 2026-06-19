@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "switches": [
+    {
+      "env": "prod",
+      "name": "new_checkout_flow",
+      "author": "alice@local",
+      "rollout_ratio": 30,
+      "whitelist": ["user:1001", "user:1002"],
+      "dependencies": ["unified_login_v2"],
+      "default_value": true
+    },
+    {
+      "env": "prod",
+      "name": "unified_login_v2",
+      "author": "alice@local",
+      "rollout_ratio": 100,
+      "whitelist": [],
+      "dependencies": [],
+      "default_value": true
+    }
+  ]
+}

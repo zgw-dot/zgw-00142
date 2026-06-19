@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feature-switch-local"
+version = "1.0.0"
+description = "Local feature switch gray release console (CLI + SQLite)."
+requires-python = ">=3.9"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+fswitch = "feature_switch.cli.main:_main_entry"
+
+[tool.setuptools.packages.find]
+include = ["feature_switch*"]

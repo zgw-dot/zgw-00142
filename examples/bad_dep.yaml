@@ -1,0 +1,10 @@
+schema_version: "1.0"
+switches:
+  - env: prod
+    name: depends_on_missing
+    author: alice@local
+    rollout_ratio: 50
+    whitelist: []
+    dependencies:
+      - this_switch_does_not_exist_at_all
+    default_value: false

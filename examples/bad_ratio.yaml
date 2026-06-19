@@ -1,0 +1,9 @@
+schema_version: "1.0"
+switches:
+  - env: prod
+    name: risky_feature
+    author: alice@local
+    rollout_ratio: 150
+    whitelist: []
+    dependencies: []
+    default_value: true
