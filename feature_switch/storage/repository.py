@@ -7,8 +7,16 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
-from ..core.enums import VersionStatus, AuditAction
-from ..core.models import FeatureSwitch, SwitchVersion, AuditLog
+from ..core.enums import VersionStatus, AuditAction, MigrationStatus
+from ..core.models import (
+    FeatureSwitch,
+    SwitchVersion,
+    AuditLog,
+    MigrationPackage,
+    MigrationSwitchSnapshot,
+    MigrationRecord,
+    _MIGRATION_SCHEMA_VERSION,
+)
 
 
 SCHEMA_SQL = """
@@ -64,6 +72,65 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 CREATE INDEX IF NOT EXISTS idx_audit_switch
     ON audit_log(env, switch_name, timestamp);
+
+-- 迁移包：从源环境导出的一批开关快照
+CREATE TABLE IF NOT EXISTS migration_package (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id              TEXT NOT NULL UNIQUE,
+    source_env              TEXT NOT NULL,
+    target_env              TEXT NOT NULL,
+    created_by              TEXT NOT NULL,
+    description             TEXT NOT NULL DEFAULT '',
+    status                  TEXT NOT NULL DEFAULT 'CREATED',
+    checksum                TEXT NOT NULL DEFAULT '',
+    created_at              TEXT NOT NULL,
+    previewed_at            TEXT,
+    imported_at             TEXT,
+    approved_by             TEXT,
+    approved_at             TEXT,
+    rejected_by             TEXT,
+    rejected_at             TEXT,
+    reject_reason           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_migration_package_env
+    ON migration_package(source_env, target_env, status);
+
+-- 迁移包里每个开关的快照
+CREATE TABLE IF NOT EXISTS migration_switch (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id       INTEGER NOT NULL,
+    package_uuid     TEXT NOT NULL,
+    env              TEXT NOT NULL,
+    name             TEXT NOT NULL,
+    version          INTEGER NOT NULL,
+    rollout_ratio    INTEGER NOT NULL,
+    whitelist        TEXT NOT NULL DEFAULT '[]',
+    dependencies     TEXT NOT NULL DEFAULT '[]',
+    default_value    INTEGER NOT NULL DEFAULT 0,
+    author           TEXT NOT NULL,
+    approver         TEXT,
+    published_at     TEXT,
+    UNIQUE(package_id, env, name),
+    FOREIGN KEY (package_id) REFERENCES migration_package(id) ON DELETE CASCADE
+);
+
+-- 迁移执行记录（审计链）
+CREATE TABLE IF NOT EXISTS migration_record (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id                 TEXT NOT NULL,
+    action                     TEXT NOT NULL,
+    actor                      TEXT NOT NULL,
+    env                        TEXT NOT NULL,
+    switch_name                TEXT,
+    version                    INTEGER,
+    details                    TEXT NOT NULL DEFAULT '',
+    rollback_source_package_id TEXT,
+    timestamp                  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_migration_record_pkg
+    ON migration_record(package_id, timestamp);
 """
 
 
@@ -346,3 +413,174 @@ class SwitchRepository:
         params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
         return [AuditLog.from_row(dict(r)) for r in rows]
+
+    # ---------- MigrationPackage ----------
+
+    def insert_migration_package(
+        self, pkg: MigrationPackage, *, conn: Optional[sqlite3.Connection] = None
+    ) -> MigrationPackage:
+        c = conn or self._conn
+        status_val = pkg.status.value if isinstance(pkg.status, MigrationStatus) else pkg.status
+        cur = c.execute(
+            """
+            INSERT INTO migration_package(
+                package_id, source_env, target_env, created_by, description,
+                status, checksum, created_at, previewed_at, imported_at,
+                approved_by, approved_at, rejected_by, rejected_at, reject_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                pkg.package_id, pkg.source_env, pkg.target_env, pkg.created_by,
+                pkg.description, status_val, pkg.checksum, pkg.created_at,
+                pkg.previewed_at, pkg.imported_at, pkg.approved_by, pkg.approved_at,
+                pkg.rejected_by, pkg.rejected_at, pkg.reject_reason,
+            ),
+        )
+        pkg.id = cur.lastrowid
+        # Insert switches
+        for snap in pkg.switches:
+            c.execute(
+                """
+                INSERT INTO migration_switch(
+                    package_id, package_uuid, env, name, version,
+                    rollout_ratio, whitelist, dependencies, default_value,
+                    author, approver, published_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pkg.id, pkg.package_id, snap.env, snap.name, snap.version,
+                    snap.rollout_ratio,
+                    json.dumps(snap.whitelist, ensure_ascii=False),
+                    json.dumps(snap.dependencies, ensure_ascii=False),
+                    1 if snap.default_value else 0,
+                    snap.author, snap.approver, snap.published_at,
+                ),
+            )
+        return pkg
+
+    def update_migration_package_fields(
+        self,
+        package_id: str,
+        updates: dict[str, Any],
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        if not updates:
+            return
+        c = conn or self._conn
+        if "status" in updates and isinstance(updates["status"], MigrationStatus):
+            updates["status"] = updates["status"].value
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [package_id]
+        c.execute(f"UPDATE migration_package SET {sets} WHERE package_id = ?", values)
+
+    def get_migration_package(
+        self, package_id: str
+    ) -> Optional[MigrationPackage]:
+        row = self._conn.execute(
+            "SELECT * FROM migration_package WHERE package_id = ?", (package_id,)
+        ).fetchone()
+        if not row:
+            return None
+        switches = self._list_migration_switches(row["id"])
+        d = dict(row)
+        return MigrationPackage(
+            id=d["id"],
+            package_id=d["package_id"],
+            source_env=d["source_env"],
+            target_env=d["target_env"],
+            created_by=d["created_by"],
+            description=d.get("description") or "",
+            status=MigrationStatus(d["status"]),
+            checksum=d.get("checksum") or "",
+            created_at=d["created_at"],
+            previewed_at=d.get("previewed_at"),
+            imported_at=d.get("imported_at"),
+            approved_by=d.get("approved_by"),
+            approved_at=d.get("approved_at"),
+            rejected_by=d.get("rejected_by"),
+            rejected_at=d.get("rejected_at"),
+            reject_reason=d.get("reject_reason"),
+            switches=switches,
+        )
+
+    def find_migration_by_checksum(
+        self, source_env: str, target_env: str, checksum: str
+    ) -> Optional[MigrationPackage]:
+        row = self._conn.execute(
+            """
+            SELECT * FROM migration_package
+            WHERE source_env = ? AND target_env = ? AND checksum = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (source_env, target_env, checksum),
+        ).fetchone()
+        if not row:
+            return None
+        return self.get_migration_package(row["package_id"])
+
+    def list_migration_packages(
+        self,
+        source_env: Optional[str] = None,
+        target_env: Optional[str] = None,
+        statuses: Optional[list[MigrationStatus]] = None,
+    ) -> list[MigrationPackage]:
+        sql = "SELECT * FROM migration_package WHERE 1=1"
+        params: list[Any] = []
+        if source_env:
+            sql += " AND source_env = ?"
+            params.append(source_env)
+        if target_env:
+            sql += " AND target_env = ?"
+            params.append(target_env)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            sql += f" AND status IN ({placeholders})"
+            params.extend(s.value for s in statuses)
+        sql += " ORDER BY id DESC"
+        rows = self._conn.execute(sql, params).fetchall()
+        result: list[MigrationPackage] = []
+        for row in rows:
+            result.append(self.get_migration_package(row["package_id"]))  # type: ignore[arg-type]
+        return result
+
+    def _list_migration_switches(self, pkg_db_id: int) -> list[MigrationSwitchSnapshot]:
+        rows = self._conn.execute(
+            "SELECT * FROM migration_switch WHERE package_id = ? ORDER BY env, name",
+            (pkg_db_id,),
+        ).fetchall()
+        return [MigrationSwitchSnapshot.from_row(dict(r)) for r in rows]
+
+    # ---------- MigrationRecord ----------
+
+    def append_migration_record(
+        self, rec: MigrationRecord, *, conn: Optional[sqlite3.Connection] = None
+    ) -> MigrationRecord:
+        c = conn or self._conn
+        cur = c.execute(
+            """
+            INSERT INTO migration_record(
+                package_id, action, actor, env, switch_name, version,
+                details, rollback_source_package_id, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                rec.package_id, rec.action, rec.actor, rec.env, rec.switch_name,
+                rec.version, rec.details, rec.rollback_source_package_id, rec.timestamp,
+            ),
+        )
+        rec.id = cur.lastrowid
+        return rec
+
+    def list_migration_records(
+        self, package_id: Optional[str] = None, limit: int = 100
+    ) -> list[MigrationRecord]:
+        sql = "SELECT * FROM migration_record WHERE 1=1"
+        params: list[Any] = []
+        if package_id:
+            sql += " AND package_id = ?"
+            params.append(package_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [MigrationRecord.from_row(dict(r)) for r in rows]

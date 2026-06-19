@@ -7,9 +7,9 @@ import sys
 from typing import Any, Callable, Optional
 
 from ..audit import AuditTrail
-from ..core.enums import VersionStatus
+from ..core.enums import MigrationStatus, VersionStatus
 from ..core.models import SwitchVersion
-from ..service import ConfigExporter, ConfigImporter, SwitchService
+from ..service import ConfigExporter, ConfigImporter, MigrationService, SwitchService
 from ..storage.repository import SwitchRepository
 from ..validator.validators import ValidationError
 
@@ -30,6 +30,7 @@ class AppContext:
         self.service = SwitchService(self.repo, self.audit)
         self.importer = ConfigImporter(self.repo, self.audit)
         self.exporter = ConfigExporter(self.repo, self.audit)
+        self.migration = MigrationService(self.repo, self.audit)
 
     def close(self) -> None:
         self.repo.close()
@@ -296,6 +297,272 @@ def cmd_import(args: argparse.Namespace, app: AppContext) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Migration package command handlers
+# ---------------------------------------------------------------------------
+
+def cmd_pkg_create(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    pkg = app.migration.create_package(
+        actor=app.actor,
+        source_env=args.source_env,
+        target_env=args.target_env,
+        description=args.description or "",
+        names=args.name or None,
+    )
+    _print_json({
+        "ok": True,
+        "package": {
+            "package_id": pkg.package_id,
+            "source_env": pkg.source_env,
+            "target_env": pkg.target_env,
+            "status": pkg.status.value if isinstance(pkg.status, MigrationStatus) else pkg.status,
+            "created_by": pkg.created_by,
+            "checksum": pkg.checksum,
+            "switch_count": len(pkg.switches),
+            "description": pkg.description,
+            "created_at": pkg.created_at,
+        },
+    })
+    return 0
+
+
+def cmd_pkg_preview(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    preview = app.migration.preview_package(actor=app.actor, package_id=args.package_id)
+    if args.format == "json":
+        _print_json({"ok": True, **preview.to_dict()})
+    else:
+        print(f"=== 迁移预演报告 {args.package_id} ===")
+        print(f"  源环境: {preview.source_env}  →  目标环境: {preview.target_env}")
+        print(f"  摘要:")
+        for k, v in preview.summary.items():
+            if v > 0:
+                print(f"    {k:<20}: {v}")
+        print(f"  依赖缺口: {preview.all_dependency_gaps or '(无)'}")
+        print(f"  需要审批: {preview.all_required_approvers or '(无)'}")
+        print(f"  阻塞问题: {len(preview.blocking_issues)} 项")
+        for b in preview.blocking_issues:
+            print(f"    ⚠️  {b}")
+        print(f"  可否导入: {'✅ 可以' if preview.can_import else '❌ 被阻塞'}")
+        print(f"  逐项详情:")
+        for e in preview.entries:
+            ct = e.change_type.value if hasattr(e.change_type, "value") else e.change_type
+            print(f"    [{ct:<18}] {e.env}:{e.name}")
+            if e.dependency_gaps:
+                print(f"      依赖缺口: {e.dependency_gaps}")
+            if e.required_approvers:
+                print(f"      需要审批: {e.required_approvers}")
+            if e.conflict_reason:
+                print(f"      冲突原因: {e.conflict_reason}")
+            for f, (old, new) in e.field_changes.items():
+                print(f"      · {f}: {old!r} → {new!r}")
+    return 0
+
+
+def cmd_pkg_import(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    result = app.migration.import_package(
+        actor=app.actor,
+        package_id=args.package_id,
+        force=bool(args.force),
+    )
+    _print_json({"ok": True, **result})
+    return 0
+
+
+def cmd_pkg_export(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    fmt = args.format_pkg
+    text = app.migration.export_package_file(
+        actor=app.actor,
+        package_id=args.package_id,
+        fmt=fmt,
+    )
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            if not text.endswith("\n"):
+                fh.write("\n")
+        _print_json({
+            "ok": True,
+            "package_id": args.package_id,
+            "output": os.path.abspath(args.output),
+            "format": fmt,
+        })
+    else:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+    return 0
+
+
+def cmd_pkg_import_file(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    pkg = app.migration.import_package_file(actor=app.actor, path=args.file)
+    _print_json({
+        "ok": True,
+        "package": {
+            "package_id": pkg.package_id,
+            "source_env": pkg.source_env,
+            "target_env": pkg.target_env,
+            "status": pkg.status.value if isinstance(pkg.status, MigrationStatus) else pkg.status,
+            "created_by": pkg.created_by,
+            "checksum": pkg.checksum,
+            "switch_count": len(pkg.switches),
+        },
+    })
+    return 0
+
+
+def cmd_pkg_list(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    statuses: Optional[list[MigrationStatus]] = None
+    if args.status:
+        statuses = []
+        for s in args.status:
+            try:
+                statuses.append(MigrationStatus(s.upper()))
+            except ValueError:
+                raise ValidationError(
+                    f"未知迁移包状态 '{s}'，可选: {[x.value for x in MigrationStatus]}"
+                )
+    pkgs = app.migration.list_packages(
+        source_env=args.source_env,
+        target_env=args.target_env,
+        statuses=statuses,
+    )
+    if args.format == "json":
+        _print_json({
+            "count": len(pkgs),
+            "packages": [
+                {
+                    "package_id": p.package_id,
+                    "source_env": p.source_env,
+                    "target_env": p.target_env,
+                    "status": p.status.value if isinstance(p.status, MigrationStatus) else p.status,
+                    "created_by": p.created_by,
+                    "checksum": p.checksum,
+                    "switch_count": len(p.switches),
+                    "description": p.description,
+                    "created_at": p.created_at,
+                    "previewed_at": p.previewed_at,
+                    "imported_at": p.imported_at,
+                    "approved_by": p.approved_by,
+                    "rejected_by": p.rejected_by,
+                }
+                for p in pkgs
+            ],
+        })
+    else:
+        for p in pkgs:
+            st = p.status.value if isinstance(p.status, MigrationStatus) else p.status
+            print(
+                f"{p.package_id:<18} {st:<18} "
+                f"{p.source_env}→{p.target_env:<16} "
+                f"switches={len(p.switches):<3} "
+                f"by={p.created_by} "
+                f"at={p.created_at}"
+            )
+    return 0
+
+
+def cmd_pkg_show(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    pkg = app.migration.get_package(args.package_id)
+    records = app.migration.list_records(args.package_id)
+    st = pkg.status.value if isinstance(pkg.status, MigrationStatus) else pkg.status
+    if args.format == "json":
+        _print_json({
+            "ok": True,
+            "package": {
+                "package_id": pkg.package_id,
+                "source_env": pkg.source_env,
+                "target_env": pkg.target_env,
+                "status": st,
+                "created_by": pkg.created_by,
+                "checksum": pkg.checksum,
+                "description": pkg.description,
+                "created_at": pkg.created_at,
+                "previewed_at": pkg.previewed_at,
+                "imported_at": pkg.imported_at,
+                "approved_by": pkg.approved_by,
+                "approved_at": pkg.approved_at,
+                "rejected_by": pkg.rejected_by,
+                "rejected_at": pkg.rejected_at,
+                "reject_reason": pkg.reject_reason,
+                "switches": [s.to_dict() for s in pkg.switches],
+            },
+            "records": [r.to_dict() for r in records],
+        })
+    else:
+        print(f"=== 迁移包 {pkg.package_id} ===")
+        print(f"  状态      : {st}")
+        print(f"  源 → 目标 : {pkg.source_env} → {pkg.target_env}")
+        print(f"  创建人    : {pkg.created_by}")
+        print(f"  描述      : {pkg.description or '(无)'}")
+        print(f"  校验和    : {pkg.checksum}")
+        print(f"  创建时间  : {pkg.created_at}")
+        if pkg.previewed_at:
+            print(f"  预演时间  : {pkg.previewed_at}")
+        if pkg.imported_at:
+            print(f"  导入时间  : {pkg.imported_at}")
+        if pkg.approved_by:
+            print(f"  包级审批  : {pkg.approved_by} @ {pkg.approved_at}")
+        if pkg.rejected_by:
+            print(f"  包级驳回  : {pkg.rejected_by} @ {pkg.rejected_at} 原因={pkg.reject_reason}")
+        print(f"  包含开关 ({len(pkg.switches)}):")
+        for s in pkg.switches:
+            print(f"    - {s.env}:{s.name} V{s.version} ratio={s.rollout_ratio}% deps={s.dependencies}")
+        print(f"  迁移记录 ({len(records)}):")
+        for r in records:
+            v = f" V{r.version}" if r.version else ""
+            n = f" {r.switch_name}" if r.switch_name else ""
+            print(f"    {r.timestamp} {r.action:<20} {r.actor:<20} {r.env}{n}{v}")
+    return 0
+
+
+def cmd_pkg_approve(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    pkg = app.migration.mark_package_approved(
+        approver=app.actor, package_id=args.package_id
+    )
+    _print_json({
+        "ok": True,
+        "package_id": pkg.package_id,
+        "status": pkg.status.value if isinstance(pkg.status, MigrationStatus) else pkg.status,
+        "approved_by": pkg.approved_by,
+        "approved_at": pkg.approved_at,
+    })
+    return 0
+
+
+def cmd_pkg_reject(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    pkg = app.migration.mark_package_rejected(
+        rejector=app.actor, package_id=args.package_id, reason=args.reason
+    )
+    _print_json({
+        "ok": True,
+        "package_id": pkg.package_id,
+        "status": pkg.status.value if isinstance(pkg.status, MigrationStatus) else pkg.status,
+        "rejected_by": pkg.rejected_by,
+        "rejected_at": pkg.rejected_at,
+        "reject_reason": pkg.reject_reason,
+    })
+    return 0
+
+
+def cmd_pkg_records(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    records = app.migration.list_records(args.package_id, limit=args.limit)
+    if args.format == "json":
+        _print_json({
+            "count": len(records),
+            "records": [r.to_dict() for r in records],
+        })
+    else:
+        for r in records:
+            v = f"V{r.version:<4}" if r.version else "----"
+            n = r.switch_name or "-"
+            print(
+                f"{r.timestamp} {r.action:<20} {r.actor:<20} "
+                f"{r.env}:{n:<24} {v} {r.details[:80]}"
+            )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
@@ -411,6 +678,68 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("import", help="从 YAML/JSON 导入 (创建草稿)")
     p.add_argument("--file", required=True, help="导入文件路径")
     p.set_defaults(func=cmd_import)
+
+    # pkg-create
+    p = sub.add_parser("pkg-create", help="从源环境创建迁移包 (取当前生效版)")
+    p.add_argument("--source-env", required=True, dest="source_env", help="源环境 (如 staging)")
+    p.add_argument("--target-env", required=True, dest="target_env", help="目标环境 (如 prod)")
+    p.add_argument("--name", nargs="*", default=None, help="只打包指定开关名 (默认所有生效版)")
+    p.add_argument("--description", default="", help="迁移包描述")
+    p.set_defaults(func=cmd_pkg_create)
+
+    # pkg-preview
+    p = sub.add_parser("pkg-preview", help="发布预演: 查看 diff/依赖缺口/覆盖预警/审批要求")
+    p.add_argument("--package-id", required=True, dest="package_id", help="迁移包 ID")
+    p.set_defaults(func=cmd_pkg_preview)
+
+    # pkg-import
+    p = sub.add_parser("pkg-import", help="导入迁移包到目标环境 (只落成 DRAFT, 不直接发布)")
+    p.add_argument("--package-id", required=True, dest="package_id", help="迁移包 ID")
+    p.add_argument("--force", action="store_true", help="强制导入 (绕过非冲突类阻塞, 同名草稿冲突仍拦截)")
+    p.set_defaults(func=cmd_pkg_import)
+
+    # pkg-export
+    p = sub.add_parser("pkg-export", help="导出迁移包为 YAML/JSON (便于回导到新库核对)")
+    p.add_argument("--package-id", required=True, dest="package_id", help="迁移包 ID")
+    p.add_argument("--format", choices=["yaml", "json"], default="yaml", dest="format_pkg",
+                   help="导出格式 (默认 yaml)")
+    p.add_argument("-o", "--output", default=None, help="输出文件路径")
+    p.set_defaults(func=cmd_pkg_export)
+
+    # pkg-import-file
+    p = sub.add_parser("pkg-import-file", help="从 YAML/JSON 文件回导迁移包定义 (不生成开关草稿)")
+    p.add_argument("--file", required=True, help="迁移包文件路径")
+    p.set_defaults(func=cmd_pkg_import_file)
+
+    # pkg-list
+    p = sub.add_parser("pkg-list", help="列出所有迁移包")
+    p.add_argument("--source-env", default=None, dest="source_env", help="按源环境过滤")
+    p.add_argument("--target-env", default=None, dest="target_env", help="按目标环境过滤")
+    p.add_argument("--status", nargs="*", default=None,
+                   help="按状态过滤, 如 CREATED PREVIEWED IMPORTED_DRAFT APPROVED REJECTED")
+    p.set_defaults(func=cmd_pkg_list)
+
+    # pkg-show
+    p = sub.add_parser("pkg-show", help="查看迁移包详情 + 迁移记录链")
+    p.add_argument("--package-id", required=True, dest="package_id", help="迁移包 ID")
+    p.set_defaults(func=cmd_pkg_show)
+
+    # pkg-approve
+    p = sub.add_parser("pkg-approve", help="包级标记审批 (越权拦截: 不能审批自己创建的包)")
+    p.add_argument("--package-id", required=True, dest="package_id", help="迁移包 ID")
+    p.set_defaults(func=cmd_pkg_approve)
+
+    # pkg-reject
+    p = sub.add_parser("pkg-reject", help="包级标记驳回 (需填原因)")
+    p.add_argument("--package-id", required=True, dest="package_id", help="迁移包 ID")
+    p.add_argument("--reason", required=True, help="驳回原因")
+    p.set_defaults(func=cmd_pkg_reject)
+
+    # pkg-records
+    p = sub.add_parser("pkg-records", help="查看某迁移包的完整迁移记录链 (审计)")
+    p.add_argument("--package-id", required=True, dest="package_id", help="迁移包 ID")
+    p.add_argument("--limit", type=int, default=100, help="返回条目上限")
+    p.set_defaults(func=cmd_pkg_records)
 
     return parser
 
