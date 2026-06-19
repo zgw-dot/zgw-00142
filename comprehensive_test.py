@@ -374,13 +374,46 @@ def main() -> int:
     c.check(code == 0, f"查询已撤销放行单成功 (code={code})")
     c.check(data.get("count") == 1, f"有 1 张已撤销 (actual={data.get('count')})")
 
-    # 4g. 按环境查询
+    # 4g. 按状态查询：已过期（核心链路）
+    code, out, _ = f("--format", "json", "pass-list", "--status", "EXPIRED")
+    data = json.loads(out)
+    c.check(code == 0, f"查询已过期放行单成功 (code={code})")
+    c.check(data.get("count") == 1, f"有 1 张已过期 (actual={data.get('count')})")
+    passes_expired = data.get("passes", [])
+    if passes_expired:
+        c.check(passes_expired[0].get("pass_id") == pass_id_expired, f"已过期放行单 ID 正确 (actual={passes_expired[0].get('pass_id')}, expected={pass_id_expired})")
+
+    # 4h. 按状态查询：APPROVED 不含已过期单据
+    code, out, _ = f("--format", "json", "pass-list", "--status", "APPROVED")
+    data = json.loads(out)
+    c.check(code == 0, f"查询 APPROVED 放行单成功 (code={code})")
+    c.check(data.get("count") == 0, f"APPROVED 查询不含已过期单据 (actual={data.get('count')})")
+
+    # 4i. 确认其他状态未回退：待审批
+    code, out, _ = f("--format", "json", "pass-list", "--status", "PENDING_APPROVAL")
+    data = json.loads(out)
+    c.check(code == 0, f"过期链路后待审批仍正确 (code={code})")
+    c.check(data.get("count") == 1, f"仍有 1 张待审批 (actual={data.get('count')})")
+
+    # 4j. 确认其他状态未回退：已使用
+    code, out, _ = f("--format", "json", "pass-list", "--status", "USED")
+    data = json.loads(out)
+    c.check(code == 0, f"过期链路后已使用仍正确 (code={code})")
+    c.check(data.get("count") == 1, f"仍有 1 张已使用 (actual={data.get('count')})")
+
+    # 4k. 确认其他状态未回退：已撤销
+    code, out, _ = f("--format", "json", "pass-list", "--status", "CANCELLED")
+    data = json.loads(out)
+    c.check(code == 0, f"过期链路后已撤销仍正确 (code={code})")
+    c.check(data.get("count") == 1, f"仍有 1 张已撤销 (actual={data.get('count')})")
+
+    # 4l. 按环境查询
     code, out, _ = f("--format", "json", "pass-list", "--env", "prod")
     data = json.loads(out)
     c.check(code == 0, f"按环境查询成功 (code={code})")
     c.check(data.get("count") == 3, f"prod 环境有 3 张放行单 (actual={data.get('count')})")
 
-    # 4h. 按申请人查询
+    # 4m. 按申请人查询
     code, out, _ = f("--format", "json", "pass-list", "--created-by", "charlie@local")
     data = json.loads(out)
     c.check(code == 0, f"按申请人查询成功 (code={code})")

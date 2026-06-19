@@ -177,6 +177,15 @@ class ReleaseWindowService:
     def _is_admin(self, actor: str) -> bool:
         return actor in self.admin_emails
 
+    @staticmethod
+    def _resolve_pass_status(
+        pass_obj: ReleasePass,
+        current_time: str,
+    ) -> ReleasePassStatus:
+        if pass_obj.status == ReleasePassStatus.APPROVED and pass_obj.valid_until < current_time:
+            return ReleasePassStatus.EXPIRED
+        return pass_obj.status
+
     def _require_window_template(self, env: str) -> ReleaseWindowTemplate:
         template = self.repo.get_release_window_template(env)
         if template is None:
@@ -948,7 +957,7 @@ class ReleaseWindowService:
         )
         count = 0
         for pass_obj in approved_passes:
-            if pass_obj.valid_until < current_time:
+            if self._resolve_pass_status(pass_obj, current_time) == ReleasePassStatus.EXPIRED:
                 self.repo.update_release_pass_fields(
                     pass_obj.pass_id,
                     {"status": ReleasePassStatus.EXPIRED},
@@ -1370,6 +1379,17 @@ class ReleaseWindowService:
     # 4. Queries
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _expand_query_statuses(
+        statuses: Optional[list[ReleasePassStatus]],
+    ) -> Optional[list[ReleasePassStatus]]:
+        if statuses is None:
+            return None
+        expanded = set(statuses)
+        if ReleasePassStatus.EXPIRED in expanded:
+            expanded.add(ReleasePassStatus.APPROVED)
+        return list(expanded) if expanded else None
+
     def list_passes(
         self,
         *,
@@ -1378,13 +1398,22 @@ class ReleaseWindowService:
         approver: Optional[str] = None,
         created_by: Optional[str] = None,
     ) -> list[ReleasePass]:
-        """列出放行单。"""
-        return self.repo.list_release_passes(
+        current_time = _now_iso()
+        query_statuses = self._expand_query_statuses(statuses)
+        raw_passes = self.repo.list_release_passes(
             env=env,
-            statuses=statuses,
+            statuses=query_statuses,
             approver=approver,
             created_by=created_by,
         )
+        result: list[ReleasePass] = []
+        for p in raw_passes:
+            effective = self._resolve_pass_status(p, current_time)
+            if statuses is None or effective in statuses:
+                if effective != p.status:
+                    p.status = effective
+                result.append(p)
+        return result
 
     def get_pass(self, pass_id: str) -> ReleasePass:
         """获取放行单详情。"""
