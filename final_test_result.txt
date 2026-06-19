@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "<string>", line 5, in <module>
+    exec(open('release_order_test.py', encoding='utf-8').read())
+    ~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<string>", line 12, in <module>
+NameError: name '__file__' is not defined. Did you mean: '__name__'?

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any, Optional
 
-from .enums import VersionStatus, AuditAction, MigrationStatus, ChangeType
+from .enums import VersionStatus, AuditAction, MigrationStatus, ChangeType, ReleaseOrderStatus
 
 
 def _now_iso() -> str:
@@ -374,5 +374,291 @@ class MigrationRecord:
             version=row.get("version"),
             details=row.get("details") or "",
             rollback_source_package_id=row.get("rollback_source_package_id"),
+            timestamp=row.get("timestamp") or _now_iso(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Release Order models (发布计划单)
+# ---------------------------------------------------------------------------
+
+_RELEASE_SCHEMA_VERSION = "1.0"
+
+
+@dataclass
+class ReleaseOrderItem:
+    """发布单中的一条明细：引用某个开关的某个版本。"""
+    env: str
+    name: str
+    version: int
+    status_before: Optional[VersionStatus] = None
+    status_after: Optional[VersionStatus] = None
+    prev_effective_version: Optional[int] = None
+    rollout_ratio: int = 0
+    whitelist: list[str] = field(default_factory=list)
+    dependencies: list[str] = field(default_factory=list)
+    default_value: bool = False
+    author: str = ""
+    id: Optional[int] = None
+    release_order_id: Optional[int] = None
+    executed: bool = False
+    rollback_snapshot: Optional[dict[str, Any]] = None
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        if self.status_before:
+            data["status_before"] = self.status_before.value
+        if self.status_after:
+            data["status_after"] = self.status_after.value
+        return data
+
+    @classmethod
+    def from_row(cls, row: dict) -> "ReleaseOrderItem":
+        import json
+
+        def _pl(raw: Any) -> list[str]:
+            if raw is None:
+                return []
+            if isinstance(raw, list):
+                return list(raw)
+            if isinstance(raw, str):
+                try:
+                    return list(json.loads(raw))
+                except (json.JSONDecodeError, TypeError):
+                    return []
+            return []
+
+        def _opt_status(raw: Any) -> Optional[VersionStatus]:
+            if raw is None:
+                return None
+            return VersionStatus(raw) if isinstance(raw, str) else raw
+
+        def _opt_snapshot(raw: Any) -> Optional[dict[str, Any]]:
+            if raw is None:
+                return None
+            if isinstance(raw, dict):
+                return raw
+            if isinstance(raw, str):
+                try:
+                    return json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    return None
+            return None
+
+        return cls(
+            id=row.get("id"),
+            release_order_id=row.get("release_order_id"),
+            env=row["env"],
+            name=row["name"],
+            version=row["version"],
+            status_before=_opt_status(row.get("status_before")),
+            status_after=_opt_status(row.get("status_after")),
+            prev_effective_version=row.get("prev_effective_version"),
+            rollout_ratio=row.get("rollout_ratio", 0),
+            whitelist=_pl(row.get("whitelist")),
+            dependencies=_pl(row.get("dependencies")),
+            default_value=bool(row.get("default_value", False)),
+            author=row.get("author", ""),
+            executed=bool(row.get("executed", False)),
+            rollback_snapshot=_opt_snapshot(row.get("rollback_snapshot")),
+        )
+
+    @classmethod
+    def from_version(cls, v: SwitchVersion) -> "ReleaseOrderItem":
+        return cls(
+            env=v.env,
+            name=v.name,
+            version=v.version,
+            status_before=v.status,
+            rollout_ratio=v.rollout_ratio,
+            whitelist=list(v.whitelist),
+            dependencies=list(v.dependencies),
+            default_value=v.default_value,
+            author=v.author,
+        )
+
+
+@dataclass
+class ReleaseOrder:
+    """发布计划单：同一环境内多条开关草稿打包成一次发布。"""
+    order_id: str
+    env: str
+    created_by: str
+    title: str = ""
+    description: str = ""
+    status: ReleaseOrderStatus = ReleaseOrderStatus.CREATED
+    items: list[ReleaseOrderItem] = field(default_factory=list)
+    id: Optional[int] = None
+    approver: Optional[str] = None
+    rejected_by: Optional[str] = None
+    reject_reason: Optional[str] = None
+    cancel_reason: Optional[str] = None
+    rollback_reason: Optional[str] = None
+    rollback_source_order_id: Optional[str] = None
+    error_message: Optional[str] = None
+    checksum: str = ""
+    created_at: str = field(default_factory=_now_iso)
+    previewed_at: Optional[str] = None
+    submitted_at: Optional[str] = None
+    approved_at: Optional[str] = None
+    rejected_at: Optional[str] = None
+    executed_at: Optional[str] = None
+    rolled_back_at: Optional[str] = None
+    cancelled_at: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["status"] = self.status.value if isinstance(self.status, ReleaseOrderStatus) else self.status
+        data["items"] = [i.to_dict() for i in self.items]
+        return data
+
+    def to_export_dict(self) -> dict:
+        return {
+            "schema_version": _RELEASE_SCHEMA_VERSION,
+            "order_id": self.order_id,
+            "env": self.env,
+            "created_by": self.created_by,
+            "title": self.title,
+            "description": self.description,
+            "checksum": self.checksum,
+            "created_at": self.created_at,
+            "item_count": len(self.items),
+            "items": [
+                {
+                    "env": i.env,
+                    "name": i.name,
+                    "version": i.version,
+                    "rollout_ratio": i.rollout_ratio,
+                    "whitelist": list(i.whitelist),
+                    "dependencies": list(i.dependencies),
+                    "default_value": i.default_value,
+                    "author": i.author,
+                }
+                for i in self.items
+            ],
+        }
+
+    @classmethod
+    def from_row(cls, row: dict, items: Optional[list[ReleaseOrderItem]] = None) -> "ReleaseOrder":
+        return cls(
+            id=row.get("id"),
+            order_id=row["order_id"],
+            env=row["env"],
+            created_by=row["created_by"],
+            title=row.get("title", ""),
+            description=row.get("description", ""),
+            status=ReleaseOrderStatus(row["status"]) if isinstance(row["status"], str) else row["status"],
+            items=items or [],
+            approver=row.get("approver"),
+            rejected_by=row.get("rejected_by"),
+            reject_reason=row.get("reject_reason"),
+            cancel_reason=row.get("cancel_reason"),
+            rollback_reason=row.get("rollback_reason"),
+            rollback_source_order_id=row.get("rollback_source_order_id"),
+            error_message=row.get("error_message"),
+            checksum=row.get("checksum", ""),
+            created_at=row.get("created_at") or _now_iso(),
+            previewed_at=row.get("previewed_at"),
+            submitted_at=row.get("submitted_at"),
+            approved_at=row.get("approved_at"),
+            rejected_at=row.get("rejected_at"),
+            executed_at=row.get("executed_at"),
+            rolled_back_at=row.get("rolled_back_at"),
+            cancelled_at=row.get("cancelled_at"),
+        )
+
+
+@dataclass
+class ReleaseOrderPreviewItem:
+    """预演时单条明细的结果。"""
+    env: str
+    name: str
+    version: int
+    current_status: VersionStatus
+    target_status: VersionStatus
+    prev_effective_version: Optional[int]
+    prev_effective_snapshot: Optional[dict[str, Any]]
+    will_override_effective: bool
+    dependency_order: int
+    field_changes: dict[str, tuple[Any, Any]]
+    dependency_gaps: list[str]
+    conflict_reason: Optional[str]
+    warnings: list[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "env": self.env,
+            "name": self.name,
+            "version": self.version,
+            "current_status": self.current_status.value,
+            "target_status": self.target_status.value,
+            "prev_effective_version": self.prev_effective_version,
+            "will_override_effective": self.will_override_effective,
+            "dependency_order": self.dependency_order,
+            "field_changes": {k: list(v) for k, v in self.field_changes.items()},
+            "dependency_gaps": list(self.dependency_gaps),
+            "conflict_reason": self.conflict_reason,
+            "warnings": list(self.warnings),
+        }
+
+
+@dataclass
+class ReleaseOrderPreview:
+    """发布预演结果汇总。"""
+    order_id: str
+    env: str
+    items: list[ReleaseOrderPreviewItem]
+    summary: dict[str, int]
+    dependency_order: list[str]
+    all_dependency_gaps: list[str]
+    blocking_issues: list[str]
+    warnings: list[str]
+    can_approve: bool
+    can_execute: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "order_id": self.order_id,
+            "env": self.env,
+            "summary": dict(self.summary),
+            "items": [i.to_dict() for i in self.items],
+            "dependency_order": list(self.dependency_order),
+            "all_dependency_gaps": list(self.all_dependency_gaps),
+            "blocking_issues": list(self.blocking_issues),
+            "warnings": list(self.warnings),
+            "can_approve": self.can_approve,
+            "can_execute": self.can_execute,
+        }
+
+
+@dataclass
+class ReleaseOrderRecord:
+    """发布单操作记录（审计链）。"""
+    order_id: str
+    action: str
+    actor: str
+    env: str
+    id: Optional[int] = None
+    switch_name: Optional[str] = None
+    version: Optional[int] = None
+    details: str = ""
+    rollback_source_order_id: Optional[str] = None
+    timestamp: str = field(default_factory=_now_iso)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_row(cls, row: dict) -> "ReleaseOrderRecord":
+        return cls(
+            id=row.get("id"),
+            order_id=row["order_id"],
+            action=row["action"],
+            actor=row["actor"],
+            env=row["env"],
+            switch_name=row.get("switch_name"),
+            version=row.get("version"),
+            details=row.get("details") or "",
+            rollback_source_order_id=row.get("rollback_source_order_id"),
             timestamp=row.get("timestamp") or _now_iso(),
         )

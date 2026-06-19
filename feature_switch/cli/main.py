@@ -7,11 +7,22 @@ import sys
 from typing import Any, Callable, Optional
 
 from ..audit import AuditTrail
-from ..core.enums import MigrationStatus, VersionStatus
+from ..core.enums import MigrationStatus, ReleaseOrderStatus, VersionStatus
 from ..core.models import SwitchVersion
-from ..service import ConfigExporter, ConfigImporter, MigrationService, SwitchService
+from ..service import (
+    ConfigExporter,
+    ConfigImporter,
+    MigrationService,
+    ReleaseOrderService,
+    SwitchService,
+)
 from ..storage.repository import SwitchRepository
 from ..validator.validators import ValidationError
+
+
+DEFAULT_ADMINS = set(
+    x.strip() for x in os.environ.get("FSWITCH_ADMINS", "").split(",") if x.strip()
+)
 
 
 DEFAULT_DB = os.environ.get(
@@ -31,6 +42,9 @@ class AppContext:
         self.importer = ConfigImporter(self.repo, self.audit)
         self.exporter = ConfigExporter(self.repo, self.audit)
         self.migration = MigrationService(self.repo, self.audit)
+        self.release = ReleaseOrderService(
+            self.repo, self.audit, admin_emails=DEFAULT_ADMINS
+        )
 
     def close(self) -> None:
         self.repo.close()
@@ -563,6 +577,377 @@ def cmd_pkg_records(args: argparse.Namespace, app: AppContext) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Release Order command handlers
+# ---------------------------------------------------------------------------
+
+def cmd_rel_create(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    items_data: list[dict[str, Any]] = []
+    names_versions = args.item or []
+    for nv in names_versions:
+        if ":" not in nv:
+            raise ValidationError(f"item 格式错误，应为 name:version，收到 {nv!r}")
+        name, ver_str = nv.split(":", 1)
+        try:
+            version = int(ver_str)
+        except ValueError:
+            raise ValidationError(f"版本号必须是整数，收到 {ver_str!r}")
+        items_data.append({"name": name, "version": version})
+
+    order = app.release.create_order(
+        actor=app.actor,
+        env=args.env,
+        items=items_data,
+        title=args.title or "",
+        description=args.description or "",
+    )
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    _print_json({
+        "ok": True,
+        "order": {
+            "order_id": order.order_id,
+            "env": order.env,
+            "status": st,
+            "created_by": order.created_by,
+            "title": order.title,
+            "checksum": order.checksum,
+            "item_count": len(order.items),
+            "items": [
+                {
+                    "name": i.name,
+                    "version": i.version,
+                    "status_before": i.status_before.value if i.status_before else None,
+                }
+                for i in order.items
+            ],
+        },
+    })
+    return 0
+
+
+def cmd_rel_preview(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    preview = app.release.preview_order(actor=app.actor, order_id=args.order_id)
+    if args.format == "json":
+        _print_json({"ok": True, **preview.to_dict()})
+    else:
+        print(f"=== 发布预演报告 {args.order_id} ===")
+        print(f"  环境: {preview.env}")
+        print(f"  摘要:")
+        for k, v in preview.summary.items():
+            if v > 0:
+                print(f"    {k:<20}: {v}")
+        print(f"  依赖顺序: {preview.dependency_order}")
+        print(f"  依赖缺口: {preview.all_dependency_gaps or '(无)'}")
+        print(f"  阻塞问题: {len(preview.blocking_issues)} 项")
+        for b in preview.blocking_issues:
+            print(f"    ⚠️  {b}")
+        print(f"  警告: {len(preview.warnings)} 项")
+        for w in preview.warnings:
+            print(f"    ⚪  {w}")
+        print(f"  可否审批: {'✅ 可以' if preview.can_approve else '❌ 被阻塞'}")
+        print(f"  可否执行: {'✅ 可以' if preview.can_execute else '❌ 被阻塞'}")
+        print(f"  逐项详情:")
+        for e in preview.items:
+            cs = e.current_status.value
+            ts = e.target_status.value
+            print(f"    [dep#{e.dependency_order:<2}] {e.env}:{e.name} V{e.version}")
+            print(f"      状态: {cs} → {ts}")
+            if e.will_override_effective:
+                print(f"      ⚠️  将覆盖当前生效版 V{e.prev_effective_version}")
+            if e.dependency_gaps:
+                print(f"      依赖缺口: {e.dependency_gaps}")
+            if e.conflict_reason:
+                print(f"      冲突: {e.conflict_reason}")
+            if e.warnings:
+                for w in e.warnings:
+                    print(f"      警告: {w}")
+            for f, (old, new) in e.field_changes.items():
+                print(f"      · {f}: {old!r} → {new!r}")
+    return 0
+
+
+def cmd_rel_submit(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    order = app.release.submit_for_approval(actor=app.actor, order_id=args.order_id)
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    _print_json({
+        "ok": True,
+        "order_id": order.order_id,
+        "status": st,
+        "submitted_at": order.submitted_at,
+    })
+    return 0
+
+
+def cmd_rel_approve(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    order = app.release.approve_order(approver=app.actor, order_id=args.order_id)
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    _print_json({
+        "ok": True,
+        "order_id": order.order_id,
+        "status": st,
+        "approver": order.approver,
+        "approved_at": order.approved_at,
+    })
+    return 0
+
+
+def cmd_rel_reject(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    order = app.release.reject_order(
+        rejector=app.actor, order_id=args.order_id, reason=args.reason
+    )
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    _print_json({
+        "ok": True,
+        "order_id": order.order_id,
+        "status": st,
+        "rejected_by": order.rejected_by,
+        "reject_reason": order.reject_reason,
+    })
+    return 0
+
+
+def cmd_rel_execute(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    order = app.release.execute_order(actor=app.actor, order_id=args.order_id)
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    _print_json({
+        "ok": True,
+        "order_id": order.order_id,
+        "status": st,
+        "executed_at": order.executed_at,
+        "executed_items": [
+            {"name": i.name, "version": i.version, "status_after": i.status_after.value if i.status_after else None}
+            for i in order.items if i.executed
+        ],
+    })
+    return 0
+
+
+def cmd_rel_rollback(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    order = app.release.rollback_order(
+        actor=app.actor, order_id=args.order_id, reason=args.reason
+    )
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    _print_json({
+        "ok": True,
+        "order_id": order.order_id,
+        "status": st,
+        "rollback_reason": order.rollback_reason,
+        "rolled_back_at": order.rolled_back_at,
+    })
+    return 0
+
+
+def cmd_rel_cancel(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    order = app.release.cancel_order(
+        actor=app.actor, order_id=args.order_id, reason=args.reason
+    )
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    _print_json({
+        "ok": True,
+        "order_id": order.order_id,
+        "status": st,
+        "cancel_reason": order.cancel_reason,
+        "cancelled_at": order.cancelled_at,
+    })
+    return 0
+
+
+def cmd_rel_copy(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    order = app.release.copy_order(actor=app.actor, order_id=args.order_id)
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    _print_json({
+        "ok": True,
+        "order_id": order.order_id,
+        "status": st,
+        "created_by": order.created_by,
+        "item_count": len(order.items),
+        "copied_from": args.order_id,
+    })
+    return 0
+
+
+def cmd_rel_export(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    fmt = args.format_rel
+    text = app.release.export_order(
+        actor=app.actor, order_id=args.order_id, fmt=fmt
+    )
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            if not text.endswith("\n"):
+                fh.write("\n")
+        _print_json({
+            "ok": True,
+            "order_id": args.order_id,
+            "output": os.path.abspath(args.output),
+            "format": fmt,
+        })
+    else:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+    return 0
+
+
+def cmd_rel_import(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    order = app.release.import_order_file(actor=app.actor, path=args.file)
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    _print_json({
+        "ok": True,
+        "order": {
+            "order_id": order.order_id,
+            "env": order.env,
+            "status": st,
+            "created_by": order.created_by,
+            "checksum": order.checksum,
+            "item_count": len(order.items),
+        },
+    })
+    return 0
+
+
+def cmd_rel_list(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    statuses: Optional[list[ReleaseOrderStatus]] = None
+    if args.status:
+        statuses = []
+        for s in args.status:
+            try:
+                statuses.append(ReleaseOrderStatus(s.upper()))
+            except ValueError:
+                raise ValidationError(
+                    f"未知发布单状态 '{s}'，可选: {[x.value for x in ReleaseOrderStatus]}"
+                )
+    orders = app.release.list_orders(env=args.env, statuses=statuses)
+    if args.format == "json":
+        _print_json({
+            "count": len(orders),
+            "orders": [
+                {
+                    "order_id": o.order_id,
+                    "env": o.env,
+                    "status": o.status.value if isinstance(o.status, ReleaseOrderStatus) else o.status,
+                    "created_by": o.created_by,
+                    "approver": o.approver,
+                    "title": o.title,
+                    "checksum": o.checksum,
+                    "item_count": len(o.items),
+                    "created_at": o.created_at,
+                    "submitted_at": o.submitted_at,
+                    "approved_at": o.approved_at,
+                    "executed_at": o.executed_at,
+                    "rolled_back_at": o.rolled_back_at,
+                    "rollback_reason": o.rollback_reason,
+                }
+                for o in orders
+            ],
+        })
+    else:
+        for o in orders:
+            st = o.status.value if isinstance(o.status, ReleaseOrderStatus) else o.status
+            print(
+                f"{o.order_id:<18} {st:<22} {o.env:<10} "
+                f"items={len(o.items):<3} by={o.created_by:<20} "
+                f"at={o.created_at}"
+            )
+    return 0
+
+
+def cmd_rel_show(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    order = app.release.get_order(args.order_id)
+    records = app.release.list_records(args.order_id)
+    st = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+    if args.format == "json":
+        _print_json({
+            "ok": True,
+            "order": {
+                "order_id": order.order_id,
+                "env": order.env,
+                "status": st,
+                "created_by": order.created_by,
+                "approver": order.approver,
+                "title": order.title,
+                "description": order.description,
+                "checksum": order.checksum,
+                "error_message": order.error_message,
+                "created_at": order.created_at,
+                "previewed_at": order.previewed_at,
+                "submitted_at": order.submitted_at,
+                "approved_at": order.approved_at,
+                "rejected_at": order.rejected_at,
+                "reject_reason": order.reject_reason,
+                "executed_at": order.executed_at,
+                "rolled_back_at": order.rolled_back_at,
+                "rollback_reason": order.rollback_reason,
+                "rollback_source_order_id": order.rollback_source_order_id,
+                "cancelled_at": order.cancelled_at,
+                "cancel_reason": order.cancel_reason,
+                "items": [i.to_dict() for i in order.items],
+            },
+            "records": [r.to_dict() for r in records],
+        })
+    else:
+        print(f"=== 发布单 {order.order_id} ===")
+        print(f"  状态        : {st}")
+        print(f"  环境        : {order.env}")
+        print(f"  创建人      : {order.created_by}")
+        if order.approver:
+            print(f"  审批人      : {order.approver}")
+        print(f"  标题        : {order.title or '(无)'}")
+        print(f"  描述        : {order.description or '(无)'}")
+        print(f"  校验和      : {order.checksum}")
+        print(f"  创建时间    : {order.created_at}")
+        if order.previewed_at:
+            print(f"  预演时间    : {order.previewed_at}")
+        if order.submitted_at:
+            print(f"  提交时间    : {order.submitted_at}")
+        if order.approved_at:
+            print(f"  审批时间    : {order.approved_at}")
+        if order.rejected_at:
+            print(f"  驳回时间    : {order.rejected_at} 原因={order.reject_reason}")
+        if order.executed_at:
+            print(f"  执行时间    : {order.executed_at}")
+        if order.rolled_back_at:
+            print(f"  回滚时间    : {order.rolled_back_at} 原因={order.rollback_reason}")
+        if order.cancelled_at:
+            print(f"  撤销时间    : {order.cancelled_at} 原因={order.cancel_reason}")
+        if order.error_message:
+            print(f"  错误信息    : {order.error_message}")
+        print(f"  包含明细 ({len(order.items)}):")
+        for i in order.items:
+            sb = i.status_before.value if i.status_before else "-"
+            sa = i.status_after.value if i.status_after else "-"
+            exec_flag = "✅" if i.executed else "⬜"
+            print(f"    {exec_flag} {i.env}:{i.name} V{i.version}  {sb} → {sa}")
+            if i.prev_effective_version:
+                print(f"       覆盖生效版 V{i.prev_effective_version}")
+        print(f"  操作记录 ({len(records)}):")
+        for r in records:
+            v = f" V{r.version}" if r.version else ""
+            n = f" {r.switch_name}" if r.switch_name else ""
+            print(f"    {r.timestamp} {r.action:<20} {r.actor:<20} {r.env}{n}{v}")
+    return 0
+
+
+def cmd_rel_records(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    records = app.release.list_records(args.order_id, limit=args.limit)
+    if args.format == "json":
+        _print_json({
+            "count": len(records),
+            "records": [r.to_dict() for r in records],
+        })
+    else:
+        for r in records:
+            v = f"V{r.version:<4}" if r.version else "----"
+            n = r.switch_name or "-"
+            src = f" from={r.rollback_source_order_id}" if r.rollback_source_order_id else ""
+            print(
+                f"{r.timestamp} {r.action:<20} {r.actor:<20} "
+                f"{r.env}:{n:<24} {v}{src} {r.details[:60]}"
+            )
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
@@ -741,6 +1126,88 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=100, help="返回条目上限")
     p.set_defaults(func=cmd_pkg_records)
 
+    # rel-create
+    p = sub.add_parser("rel-create", help="创建发布单（从 DRAFT/PENDING_APPROVAL 版本组单）")
+    p.add_argument("--env", required=True, help="环境（所有开关必须在同一环境）")
+    p.add_argument("--item", nargs="+", required=True, help="开关名:版本号，如 feature_a:1 feature_b:2")
+    p.add_argument("--title", default="", help="发布单标题")
+    p.add_argument("--description", default="", help="发布单描述")
+    p.set_defaults(func=cmd_rel_create)
+
+    # rel-preview
+    p = sub.add_parser("rel-preview", help="发布预演：查看依赖顺序/冲突/覆盖预警/最终状态")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.set_defaults(func=cmd_rel_preview)
+
+    # rel-submit
+    p = sub.add_parser("rel-submit", help="提交审批：CREATED -> PENDING_APPROVAL")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.set_defaults(func=cmd_rel_submit)
+
+    # rel-approve
+    p = sub.add_parser("rel-approve", help="审批通过：PENDING_APPROVAL -> APPROVED（自审拦截）")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.set_defaults(func=cmd_rel_approve)
+
+    # rel-reject
+    p = sub.add_parser("rel-reject", help="驳回：PENDING_APPROVAL -> REJECTED")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.add_argument("--reason", required=True, help="驳回原因")
+    p.set_defaults(func=cmd_rel_reject)
+
+    # rel-execute
+    p = sub.add_parser("rel-execute", help="执行发布单：APPROVED -> EXECUTED（原子化，事务保证）")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.set_defaults(func=cmd_rel_execute)
+
+    # rel-rollback
+    p = sub.add_parser("rel-rollback", help="整单回滚：EXECUTED -> ROLLED_BACK（反向顺序+快照恢复）")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.add_argument("--reason", required=True, help="回滚原因")
+    p.set_defaults(func=cmd_rel_rollback)
+
+    # rel-cancel
+    p = sub.add_parser("rel-cancel", help="撤销发布单（未执行的单）")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.add_argument("--reason", required=True, help="撤销原因")
+    p.set_defaults(func=cmd_rel_cancel)
+
+    # rel-copy
+    p = sub.add_parser("rel-copy", help="复制发布单（生成新单，状态重置为 CREATED）")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.set_defaults(func=cmd_rel_copy)
+
+    # rel-export
+    p = sub.add_parser("rel-export", help="导出发布单为 YAML/JSON（含校验和）")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.add_argument("--format", choices=["yaml", "json"], default="yaml", dest="format_rel",
+                   help="导出格式 (默认 yaml)")
+    p.add_argument("-o", "--output", default=None, help="输出文件路径")
+    p.set_defaults(func=cmd_rel_export)
+
+    # rel-import
+    p = sub.add_parser("rel-import", help="从 YAML/JSON 导入发布单（校验 schema 和校验和）")
+    p.add_argument("--file", required=True, help="发布单文件路径")
+    p.set_defaults(func=cmd_rel_import)
+
+    # rel-list
+    p = sub.add_parser("rel-list", help="列出所有发布单")
+    p.add_argument("--env", default=None, help="按环境过滤")
+    p.add_argument("--status", nargs="*", default=None,
+                   help="按状态过滤，如 CREATED PENDING_APPROVAL APPROVED EXECUTED ROLLED_BACK")
+    p.set_defaults(func=cmd_rel_list)
+
+    # rel-show
+    p = sub.add_parser("rel-show", help="查看发布单详情 + 操作记录链")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.set_defaults(func=cmd_rel_show)
+
+    # rel-records
+    p = sub.add_parser("rel-records", help="查看某发布单的完整操作记录链（审计）")
+    p.add_argument("--order-id", required=True, dest="order_id", help="发布单 ID")
+    p.add_argument("--limit", type=int, default=100, help="返回条目上限")
+    p.set_defaults(func=cmd_rel_records)
+
     return parser
 
 
@@ -750,6 +1217,10 @@ def cli(argv: Optional[list[str]] = None) -> int:
     # export subparser overrides --format
     if hasattr(args, "format_export"):
         args.format = args.format_export
+    if hasattr(args, "format_pkg"):
+        args.format = args.format_pkg
+    if hasattr(args, "format_rel"):
+        args.format = args.format_rel
 
     app = build_app(db_path=args.db, actor=args.actor)
     try:

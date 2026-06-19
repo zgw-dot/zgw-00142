@@ -1,0 +1,1 @@
+NameError: name '__file__' is not defined. Did you mean: '__name__'?

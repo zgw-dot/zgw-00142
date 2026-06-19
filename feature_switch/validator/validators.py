@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Optional, TYPE_CHECKING
 
-from ..core.enums import VersionStatus, VALID_TRANSITIONS
+from ..core.enums import VersionStatus, VALID_TRANSITIONS, ReleaseOrderStatus, VALID_RELEASE_TRANSITIONS
 
 if TYPE_CHECKING:
     from ..storage.repository import SwitchRepository
@@ -337,3 +337,125 @@ def _split_top_level(text: str, sep: str) -> list[str]:
     if cur:
         parts.append("".join(cur))
     return parts
+
+
+# ---------------------------------------------------------------------------
+# Release Order validations
+# ---------------------------------------------------------------------------
+
+def validate_release_transition(
+    current: ReleaseOrderStatus, target: ReleaseOrderStatus
+) -> None:
+    allowed = VALID_RELEASE_TRANSITIONS.get(current, [])
+    if target not in allowed:
+        raise ValidationError(
+            f"发布单不允许的状态流转: {current.value} -> {target.value}。"
+            f"允许的目标状态: {[s.value for s in allowed] or '(无)'}",
+            field="status",
+        )
+
+
+def validate_release_not_self_approve(created_by: str, approver: str) -> None:
+    if created_by == approver:
+        raise ValidationError(
+            f"发布单创建人 '{created_by}' 不能审批自己的发布单，必须由其他人审批",
+            field="approver",
+        )
+
+
+def validate_release_admin_role(actor: str, is_admin: bool) -> None:
+    if not is_admin:
+        raise ValidationError(
+            f"操作被拒绝：'{actor}' 不是管理员，此操作需要管理员权限",
+            field="actor",
+        )
+
+
+def validate_release_item_env(env: str, items: list[dict[str, Any]]) -> None:
+    for idx, item in enumerate(items):
+        if item.get("env") != env:
+            raise ValidationError(
+                f"发布单明细[{idx}] 环境不一致：期望 '{env}'，实际 '{item.get('env')}'。"
+                f"发布单只能包含同一环境的开关。",
+                field="env",
+            )
+
+
+def validate_release_no_duplicate_items(items: list[dict[str, Any]]) -> None:
+    seen: set[tuple[str, str]] = set()
+    for idx, item in enumerate(items):
+        key = (item.get("env"), item.get("name"))
+        if key in seen:
+            raise ValidationError(
+                f"发布单明细[{idx}] 存在重复开关：{key[0]}:{key[1]}",
+                field="name",
+            )
+        seen.add(key)
+
+
+def validate_release_items_not_empty(items: list[Any]) -> None:
+    if not items:
+        raise ValidationError(
+            "发布单必须至少包含一条明细",
+            field="items",
+        )
+
+
+def validate_release_version_status(
+    version: Any, allowed_statuses: list[VersionStatus]
+) -> None:
+    if version.status not in allowed_statuses:
+        raise ValidationError(
+            f"开关 '{version.env}:{version.name}' V{version.version} 状态为 {version.status.value}，"
+            f"不在允许的状态列表 {[s.value for s in allowed_statuses]} 中",
+            field="status",
+        )
+
+
+def validate_release_payload(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValidationError(f"发布单配置必须是对象/mapping，收到 {type(data).__name__}")
+
+    required = ("env", "items")
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise ValidationError(f"缺少必填字段: {missing}")
+
+    env = data["env"]
+    items = data["items"]
+
+    if not isinstance(env, str) or not env.strip():
+        raise ValidationError("env 必须是非空字符串", field="env")
+
+    if not isinstance(items, list):
+        raise ValidationError("items 必须是列表", field="items")
+
+    validate_release_items_not_empty(items)
+
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValidationError(f"items[{idx}] 必须是对象")
+        item_required = ("name", "version")
+        item_missing = [k for k in item_required if k not in item]
+        if item_missing:
+            raise ValidationError(f"items[{idx}] 缺少必填字段: {item_missing}")
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError(f"items[{idx}].name 必须是非空字符串", field="name")
+        version = item.get("version")
+        if not isinstance(version, int) or version <= 0:
+            raise ValidationError(f"items[{idx}].version 必须是正整数", field="version")
+
+    item_dicts = [dict(it) for it in items]
+    for it in item_dicts:
+        it.setdefault("env", env)
+
+    validate_release_item_env(env, item_dicts)
+    validate_release_no_duplicate_items(item_dicts)
+
+    return {
+        "env": env.strip(),
+        "title": (data.get("title") or "").strip(),
+        "description": (data.get("description") or "").strip(),
+        "items": item_dicts,
+    }

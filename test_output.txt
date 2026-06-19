@@ -1,0 +1,13 @@
+
+[PASS] [0] 准备基础数据：创建 4 个开关草稿，其中 2 个带依赖关系
+Traceback (most recent call last):
+  File "D:\workSpace\AI__SPACE\02-label\zgw-00142\release_order_test.py", line 606, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "D:\workSpace\AI__SPACE\02-label\zgw-00142\release_order_test.py", line 102, in main
+    all_ok &= c.report()
+              ~~~~~~~~^^
+  File "D:\workSpace\AI__SPACE\02-label\zgw-00142\release_order_test.py", line 43, in report
+    print(m)
+    ~~~~~^^^
+UnicodeEncodeError: 'gbk' codec can't encode character '\u2705' in position 2: illegal multibyte sequence

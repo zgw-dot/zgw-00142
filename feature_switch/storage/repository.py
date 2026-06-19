@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
-from ..core.enums import VersionStatus, AuditAction, MigrationStatus
+from ..core.enums import VersionStatus, AuditAction, MigrationStatus, ReleaseOrderStatus
 from ..core.models import (
     FeatureSwitch,
     SwitchVersion,
@@ -16,6 +16,10 @@ from ..core.models import (
     MigrationSwitchSnapshot,
     MigrationRecord,
     _MIGRATION_SCHEMA_VERSION,
+    ReleaseOrder,
+    ReleaseOrderItem,
+    ReleaseOrderRecord,
+    _RELEASE_SCHEMA_VERSION,
 )
 
 
@@ -131,6 +135,78 @@ CREATE TABLE IF NOT EXISTS migration_record (
 
 CREATE INDEX IF NOT EXISTS idx_migration_record_pkg
     ON migration_record(package_id, timestamp);
+
+-- 发布计划单
+CREATE TABLE IF NOT EXISTS release_order (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id                    TEXT NOT NULL UNIQUE,
+    env                         TEXT NOT NULL,
+    created_by                  TEXT NOT NULL,
+    title                       TEXT NOT NULL DEFAULT '',
+    description                 TEXT NOT NULL DEFAULT '',
+    status                      TEXT NOT NULL DEFAULT 'CREATED',
+    approver                    TEXT,
+    rejected_by                 TEXT,
+    reject_reason               TEXT,
+    cancel_reason               TEXT,
+    rollback_reason             TEXT,
+    rollback_source_order_id    TEXT,
+    error_message               TEXT,
+    checksum                    TEXT NOT NULL DEFAULT '',
+    created_at                  TEXT NOT NULL,
+    previewed_at                TEXT,
+    submitted_at                TEXT,
+    approved_at                 TEXT,
+    rejected_at                 TEXT,
+    executed_at                 TEXT,
+    rolled_back_at              TEXT,
+    cancelled_at                TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_order_env
+    ON release_order(env, status, created_at);
+
+-- 发布单明细
+CREATE TABLE IF NOT EXISTS release_order_item (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    release_order_id        INTEGER NOT NULL,
+    release_order_uuid      TEXT NOT NULL,
+    env                     TEXT NOT NULL,
+    name                    TEXT NOT NULL,
+    version                 INTEGER NOT NULL,
+    status_before           TEXT,
+    status_after            TEXT,
+    prev_effective_version  INTEGER,
+    rollout_ratio           INTEGER NOT NULL DEFAULT 0,
+    whitelist               TEXT NOT NULL DEFAULT '[]',
+    dependencies            TEXT NOT NULL DEFAULT '[]',
+    default_value           INTEGER NOT NULL DEFAULT 0,
+    author                  TEXT NOT NULL DEFAULT '',
+    executed                INTEGER NOT NULL DEFAULT 0,
+    rollback_snapshot       TEXT,
+    UNIQUE(release_order_id, env, name),
+    FOREIGN KEY (release_order_id) REFERENCES release_order(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_order_item_switch
+    ON release_order_item(env, name, version);
+
+-- 发布单操作记录（审计链）
+CREATE TABLE IF NOT EXISTS release_order_record (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id                   TEXT NOT NULL,
+    action                     TEXT NOT NULL,
+    actor                      TEXT NOT NULL,
+    env                        TEXT NOT NULL,
+    switch_name                TEXT,
+    version                    INTEGER,
+    details                    TEXT NOT NULL DEFAULT '',
+    rollback_source_order_id   TEXT,
+    timestamp                  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_order_record
+    ON release_order_record(order_id, timestamp);
 """
 
 
@@ -306,7 +382,12 @@ class SwitchRepository:
         return SwitchVersion.from_row(dict(row)) if row else None
 
     def get_latest_version(
-        self, env: str, name: str, statuses: Optional[list[VersionStatus]] = None
+        self,
+        env: str,
+        name: str,
+        statuses: Optional[list[VersionStatus]] = None,
+        *,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> Optional[SwitchVersion]:
         sql = "SELECT * FROM switch_version WHERE env = ? AND name = ?"
         params: list[Any] = [env, name]
@@ -315,11 +396,16 @@ class SwitchRepository:
             sql += f" AND status IN ({placeholders})"
             params.extend(s.value for s in statuses)
         sql += " ORDER BY version DESC LIMIT 1"
-        row = self._conn.execute(sql, params).fetchone()
+        c = conn or self._conn
+        row = c.execute(sql, params).fetchone()
         return SwitchVersion.from_row(dict(row)) if row else None
 
-    def get_effective_version(self, env: str, name: str) -> Optional[SwitchVersion]:
-        return self.get_latest_version(env, name, [VersionStatus.PUBLISHED])
+    def get_effective_version(
+        self, env: str, name: str, *, conn: Optional[sqlite3.Connection] = None
+    ) -> Optional[SwitchVersion]:
+        return self.get_latest_version(
+            env, name, [VersionStatus.PUBLISHED], conn=conn
+        )
 
     def get_draft_version(self, env: str, name: str) -> Optional[SwitchVersion]:
         return self.get_latest_version(
@@ -584,3 +670,213 @@ class SwitchRepository:
         params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
         return [MigrationRecord.from_row(dict(r)) for r in rows]
+
+    # ---------- ReleaseOrder ----------
+
+    def insert_release_order(
+        self, order: ReleaseOrder, *, conn: Optional[sqlite3.Connection] = None
+    ) -> ReleaseOrder:
+        c = conn or self._conn
+        status_val = order.status.value if isinstance(order.status, ReleaseOrderStatus) else order.status
+        cur = c.execute(
+            """
+            INSERT INTO release_order(
+                order_id, env, created_by, title, description, status,
+                approver, reject_reason, cancel_reason, rollback_reason,
+                rollback_source_order_id, error_message, checksum,
+                created_at, previewed_at, submitted_at, approved_at,
+                rejected_at, executed_at, rolled_back_at, cancelled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order.order_id, order.env, order.created_by, order.title,
+                order.description, status_val, order.approver, order.reject_reason,
+                order.cancel_reason, order.rollback_reason, order.rollback_source_order_id,
+                order.error_message, order.checksum, order.created_at,
+                order.previewed_at, order.submitted_at, order.approved_at,
+                order.rejected_at, order.executed_at, order.rolled_back_at,
+                order.cancelled_at,
+            ),
+        )
+        order.id = cur.lastrowid
+        for item in order.items:
+            item.release_order_id = order.id
+            self._insert_release_order_item(item, order.order_id, conn=c)
+        return order
+
+    def _insert_release_order_item(
+        self, item: ReleaseOrderItem, order_uuid: str, *, conn: Optional[sqlite3.Connection] = None
+    ) -> ReleaseOrderItem:
+        c = conn or self._conn
+        status_before = item.status_before.value if isinstance(item.status_before, VersionStatus) else item.status_before
+        status_after = item.status_after.value if isinstance(item.status_after, VersionStatus) else item.status_after
+        cur = c.execute(
+            """
+            INSERT INTO release_order_item(
+                release_order_id, release_order_uuid, env, name, version,
+                status_before, status_after, prev_effective_version,
+                rollout_ratio, whitelist, dependencies, default_value,
+                author, executed, rollback_snapshot
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item.release_order_id, order_uuid, item.env, item.name, item.version,
+                status_before, status_after, item.prev_effective_version,
+                item.rollout_ratio,
+                json.dumps(item.whitelist, ensure_ascii=False),
+                json.dumps(item.dependencies, ensure_ascii=False),
+                1 if item.default_value else 0,
+                item.author,
+                1 if item.executed else 0,
+                json.dumps(item.rollback_snapshot, ensure_ascii=False) if item.rollback_snapshot else None,
+            ),
+        )
+        item.id = cur.lastrowid
+        return item
+
+    def update_release_order_fields(
+        self,
+        order_id: str,
+        updates: dict[str, Any],
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        if not updates:
+            return
+        c = conn or self._conn
+        for k in ("whitelist", "dependencies"):
+            if k in updates and updates[k] is not None:
+                updates[k] = json.dumps(updates[k], ensure_ascii=False)
+        for k in ("default_value", "executed"):
+            if k in updates:
+                updates[k] = 1 if updates[k] else 0
+        if "status" in updates and isinstance(updates["status"], ReleaseOrderStatus):
+            updates["status"] = updates["status"].value
+        if "rollback_snapshot" in updates and updates["rollback_snapshot"] is not None:
+            updates["rollback_snapshot"] = json.dumps(updates["rollback_snapshot"], ensure_ascii=False)
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [order_id]
+        c.execute(f"UPDATE release_order SET {sets} WHERE order_id = ?", values)
+
+    def update_release_order_item_fields(
+        self,
+        item_id: int,
+        updates: dict[str, Any],
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        if not updates:
+            return
+        c = conn or self._conn
+        for k in ("whitelist", "dependencies"):
+            if k in updates and updates[k] is not None:
+                updates[k] = json.dumps(updates[k], ensure_ascii=False)
+        if "default_value" in updates:
+            updates["default_value"] = 1 if updates["default_value"] else 0
+        if "executed" in updates:
+            updates["executed"] = 1 if updates["executed"] else 0
+        if "status_before" in updates and isinstance(updates["status_before"], VersionStatus):
+            updates["status_before"] = updates["status_before"].value
+        if "status_after" in updates and isinstance(updates["status_after"], VersionStatus):
+            updates["status_after"] = updates["status_after"].value
+        if "rollback_snapshot" in updates and updates["rollback_snapshot"] is not None:
+            updates["rollback_snapshot"] = json.dumps(updates["rollback_snapshot"], ensure_ascii=False)
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [item_id]
+        c.execute(f"UPDATE release_order_item SET {sets} WHERE id = ?", values)
+
+    def get_release_order(self, order_id: str) -> Optional[ReleaseOrder]:
+        row = self._conn.execute(
+            "SELECT * FROM release_order WHERE order_id = ?", (order_id,)
+        ).fetchone()
+        if not row:
+            return None
+        items = self._list_release_order_items(row["id"])
+        return ReleaseOrder.from_row(dict(row), items=items)
+
+    def find_release_order_by_checksum(
+        self, env: str, checksum: str
+    ) -> Optional[ReleaseOrder]:
+        row = self._conn.execute(
+            """
+            SELECT * FROM release_order
+            WHERE env = ? AND checksum = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (env, checksum),
+        ).fetchone()
+        if not row:
+            return None
+        return self.get_release_order(row["order_id"])
+
+    def list_release_orders(
+        self,
+        env: Optional[str] = None,
+        statuses: Optional[list[ReleaseOrderStatus]] = None,
+    ) -> list[ReleaseOrder]:
+        sql = "SELECT * FROM release_order WHERE 1=1"
+        params: list[Any] = []
+        if env:
+            sql += " AND env = ?"
+            params.append(env)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            sql += f" AND status IN ({placeholders})"
+            params.extend(s.value for s in statuses)
+        sql += " ORDER BY id DESC"
+        rows = self._conn.execute(sql, params).fetchall()
+        result: list[ReleaseOrder] = []
+        for row in rows:
+            order = self.get_release_order(row["order_id"])
+            if order:
+                result.append(order)
+        return result
+
+    def _list_release_order_items(self, order_db_id: int) -> list[ReleaseOrderItem]:
+        rows = self._conn.execute(
+            "SELECT * FROM release_order_item WHERE release_order_id = ? ORDER BY id",
+            (order_db_id,),
+        ).fetchall()
+        return [ReleaseOrderItem.from_row(dict(r)) for r in rows]
+
+    def get_release_order_items(self, order_id: str) -> list[ReleaseOrderItem]:
+        row = self._conn.execute(
+            "SELECT id FROM release_order WHERE order_id = ?", (order_id,)
+        ).fetchone()
+        if not row:
+            return []
+        return self._list_release_order_items(row["id"])
+
+    # ---------- ReleaseOrderRecord ----------
+
+    def append_release_order_record(
+        self, rec: ReleaseOrderRecord, *, conn: Optional[sqlite3.Connection] = None
+    ) -> ReleaseOrderRecord:
+        c = conn or self._conn
+        cur = c.execute(
+            """
+            INSERT INTO release_order_record(
+                order_id, action, actor, env, switch_name, version,
+                details, rollback_source_order_id, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                rec.order_id, rec.action, rec.actor, rec.env, rec.switch_name,
+                rec.version, rec.details, rec.rollback_source_order_id, rec.timestamp,
+            ),
+        )
+        rec.id = cur.lastrowid
+        return rec
+
+    def list_release_order_records(
+        self, order_id: Optional[str] = None, limit: int = 100
+    ) -> list[ReleaseOrderRecord]:
+        sql = "SELECT * FROM release_order_record WHERE 1=1"
+        params: list[Any] = []
+        if order_id:
+            sql += " AND order_id = ?"
+            params.append(order_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [ReleaseOrderRecord.from_row(dict(r)) for r in rows]

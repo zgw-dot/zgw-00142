@@ -41,6 +41,17 @@ class AuditAction(str, Enum):
     MIGRATION_PACKAGE_PREVIEW = "MIGRATION_PACKAGE_PREVIEW"
     MIGRATION_PACKAGE_IMPORT = "MIGRATION_PACKAGE_IMPORT"
     MIGRATION_PACKAGE_EXPORT = "MIGRATION_PACKAGE_EXPORT"
+    RELEASE_ORDER_CREATE = "RELEASE_ORDER_CREATE"
+    RELEASE_ORDER_PREVIEW = "RELEASE_ORDER_PREVIEW"
+    RELEASE_ORDER_SUBMIT = "RELEASE_ORDER_SUBMIT"
+    RELEASE_ORDER_APPROVE = "RELEASE_ORDER_APPROVE"
+    RELEASE_ORDER_REJECT = "RELEASE_ORDER_REJECT"
+    RELEASE_ORDER_EXECUTE = "RELEASE_ORDER_EXECUTE"
+    RELEASE_ORDER_ROLLBACK = "RELEASE_ORDER_ROLLBACK"
+    RELEASE_ORDER_CANCEL = "RELEASE_ORDER_CANCEL"
+    RELEASE_ORDER_COPY = "RELEASE_ORDER_COPY"
+    RELEASE_ORDER_EXPORT = "RELEASE_ORDER_EXPORT"
+    RELEASE_ORDER_IMPORT = "RELEASE_ORDER_IMPORT"
 
 
 class MigrationStatus(str, Enum):
@@ -50,6 +61,55 @@ class MigrationStatus(str, Enum):
     APPROVED = "APPROVED"
     REJECTED = "REJECTED"
     ROLLED_BACK = "ROLLED_BACK"
+
+
+class ReleaseOrderStatus(str, Enum):
+    CREATED = "CREATED"
+    PREVIEWED = "PREVIEWED"
+    PENDING_APPROVAL = "PENDING_APPROVAL"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    EXECUTING = "EXECUTING"
+    EXECUTED = "EXECUTED"
+    EXECUTE_FAILED = "EXECUTE_FAILED"
+    ROLLING_BACK = "ROLLING_BACK"
+    ROLLED_BACK = "ROLLED_BACK"
+    ROLLBACK_FAILED = "ROLLBACK_FAILED"
+    CANCELLED = "CANCELLED"
+
+
+VALID_RELEASE_TRANSITIONS: dict[ReleaseOrderStatus, list[ReleaseOrderStatus]] = {
+    ReleaseOrderStatus.CREATED: [ReleaseOrderStatus.PREVIEWED, ReleaseOrderStatus.CANCELLED],
+    ReleaseOrderStatus.PREVIEWED: [ReleaseOrderStatus.PENDING_APPROVAL, ReleaseOrderStatus.CANCELLED],
+    ReleaseOrderStatus.PENDING_APPROVAL: [
+        ReleaseOrderStatus.APPROVED,
+        ReleaseOrderStatus.REJECTED,
+        ReleaseOrderStatus.CANCELLED,
+    ],
+    ReleaseOrderStatus.APPROVED: [
+        ReleaseOrderStatus.EXECUTING,
+        ReleaseOrderStatus.CANCELLED,
+    ],
+    ReleaseOrderStatus.EXECUTING: [
+        ReleaseOrderStatus.EXECUTED,
+        ReleaseOrderStatus.EXECUTE_FAILED,
+    ],
+    ReleaseOrderStatus.EXECUTED: [
+        ReleaseOrderStatus.ROLLING_BACK,
+    ],
+    ReleaseOrderStatus.EXECUTE_FAILED: [
+        ReleaseOrderStatus.ROLLING_BACK,
+        ReleaseOrderStatus.CANCELLED,
+    ],
+    ReleaseOrderStatus.ROLLING_BACK: [
+        ReleaseOrderStatus.ROLLED_BACK,
+        ReleaseOrderStatus.ROLLBACK_FAILED,
+    ],
+    ReleaseOrderStatus.ROLLED_BACK: [],
+    ReleaseOrderStatus.ROLLBACK_FAILED: [],
+    ReleaseOrderStatus.REJECTED: [],
+    ReleaseOrderStatus.CANCELLED: [],
+}
 
 
 class ChangeType(str, Enum):
