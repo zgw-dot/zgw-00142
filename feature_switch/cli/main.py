@@ -7,13 +7,14 @@ import sys
 from typing import Any, Callable, Optional
 
 from ..audit import AuditTrail
-from ..core.enums import MigrationStatus, ReleaseOrderStatus, VersionStatus
+from ..core.enums import MigrationStatus, ReleaseOrderStatus, ReleasePassStatus, VersionStatus, WindowCheckResult
 from ..core.models import SwitchVersion
 from ..service import (
     ConfigExporter,
     ConfigImporter,
     MigrationService,
     ReleaseOrderService,
+    ReleaseWindowService,
     SwitchService,
 )
 from ..storage.repository import SwitchRepository
@@ -43,6 +44,9 @@ class AppContext:
         self.exporter = ConfigExporter(self.repo, self.audit)
         self.migration = MigrationService(self.repo, self.audit)
         self.release = ReleaseOrderService(
+            self.repo, self.audit, admin_emails=DEFAULT_ADMINS
+        )
+        self.window = ReleaseWindowService(
             self.repo, self.audit, admin_emails=DEFAULT_ADMINS
         )
 
@@ -948,6 +952,377 @@ def cmd_rel_records(args: argparse.Namespace, app: AppContext) -> Optional[int]:
 
 
 # ---------------------------------------------------------------------------
+# Release Window command handlers
+# ---------------------------------------------------------------------------
+
+def _parse_time_ranges(raw: Optional[list[str]]) -> list[dict[str, str]]:
+    if not raw:
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        parts = item.split(":")
+        if len(parts) < 4:
+            raise ValidationError(
+                f"时间范围格式错误，应为 HH:MM:HH:MM[:days]，如 09:00:18:00 或 09:00:18:00:monday-friday，收到 {item!r}"
+            )
+        start = f"{parts[0].strip()}:{parts[1].strip()}"
+        end = f"{parts[2].strip()}:{parts[3].strip()}"
+        tr: dict[str, str] = {"start": start, "end": end}
+        if len(parts) >= 5 and parts[4].strip():
+            tr["days"] = parts[4].strip()
+        out.append(tr)
+    return out
+
+
+def cmd_win_create(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    allowed_time_ranges = _parse_time_ranges(args.time_range)
+    tpl = app.window.create_window_template(
+        actor=app.actor,
+        env=args.env,
+        allowed_time_ranges=allowed_time_ranges,
+        freeze_days=args.freeze_day or [],
+        on_call_approvers=args.approver or [],
+        default_description=args.description or "",
+    )
+    _print_json({"ok": True, "template": tpl.to_export_dict()})
+    return 0
+
+
+def cmd_win_update(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    updates: dict[str, Any] = {}
+    if args.time_range is not None:
+        updates["allowed_time_ranges"] = _parse_time_ranges(args.time_range)
+    if args.freeze_day is not None:
+        updates["freeze_days"] = args.freeze_day
+    if args.approver is not None:
+        updates["on_call_approvers"] = args.approver
+    if args.description is not None:
+        updates["default_description"] = args.description
+    if not updates:
+        raise ValidationError("win-update 需要至少指定一个要修改的字段")
+    tpl = app.window.update_window_template(actor=app.actor, env=args.env, **updates)
+    _print_json({"ok": True, "template": tpl.to_export_dict()})
+    return 0
+
+
+def cmd_win_delete(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    app.window.delete_window_template(actor=app.actor, env=args.env)
+    _print_json({"ok": True, "env": args.env})
+    return 0
+
+
+def cmd_win_list(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    tpls = app.window.list_window_templates()
+    if args.format == "json":
+        _print_json({
+            "count": len(tpls),
+            "templates": [t.to_export_dict() for t in tpls],
+        })
+    else:
+        for t in tpls:
+            ranges_str = "; ".join(
+                f"{r['start']}-{r['end']}{'(' + r['days'] + ')' if 'days' in r else ''}"
+                for r in t.allowed_time_ranges
+            ) or "(无)"
+            freeze_str = ", ".join(t.freeze_days) or "(无)"
+            approvers_str = ", ".join(t.on_call_approvers) or "(无)"
+            print(
+                f"{t.env:<12} 时段={ranges_str} 冻结日={freeze_str} "
+                f"审批人={approvers_str} checksum={t.checksum}"
+            )
+    return 0
+
+
+def cmd_win_show(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    tpl = app.window.get_window_template(env=args.env)
+    if args.format == "json":
+        _print_json({"ok": True, "template": tpl.to_export_dict()})
+    else:
+        print(f"=== 发布窗口模板 {tpl.env} ===")
+        print(f"  环境          : {tpl.env}")
+        print(f"  创建人        : {tpl.created_by}")
+        if tpl.updated_by:
+            print(f"  更新人        : {tpl.updated_by}")
+        print(f"  创建时间      : {tpl.created_at}")
+        if tpl.updated_at:
+            print(f"  更新时间      : {tpl.updated_at}")
+        print(f"  校验和        : {tpl.checksum}")
+        print(f"  允许时段 ({len(tpl.allowed_time_ranges)}):")
+        for r in tpl.allowed_time_ranges:
+            days = f" [{r['days']}]" if "days" in r else ""
+            print(f"    - {r['start']} ~ {r['end']}{days}")
+        print(f"  冻结日 ({len(tpl.freeze_days)}): {', '.join(tpl.freeze_days) or '(无)'}")
+        print(f"  值班审批人 ({len(tpl.on_call_approvers)}): {', '.join(tpl.on_call_approvers) or '(无)'}")
+        if tpl.default_description:
+            print(f"  默认说明      : {tpl.default_description}")
+    return 0
+
+
+def cmd_win_check(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    resp = app.window.check_window(
+        actor=app.actor,
+        env=args.env,
+        current_time=args.at,
+    )
+    if args.format == "json":
+        _print_json({
+            "ok": True,
+            "env": resp.env,
+            "result": resp.result.value,
+            "in_window": resp.in_window,
+            "message": resp.message,
+            "current_time": resp.current_time,
+            "template": resp.template.to_export_dict() if resp.template else None,
+            "applicable_pass": resp.applicable_pass.to_dict() if resp.applicable_pass else None,
+        })
+    else:
+        status_icon = "✅" if resp.in_window else "❌"
+        print(f"=== 窗口校验 {resp.env} ===")
+        print(f"  结果: {status_icon} {resp.result.value} - {resp.message}")
+        print(f"  当前时间: {resp.current_time}")
+        if resp.applicable_pass:
+            print(f"  可用放行单: {resp.applicable_pass.pass_id} "
+                  f"(有效期 {resp.applicable_pass.valid_from} ~ {resp.applicable_pass.valid_until})")
+    return 0
+
+
+def cmd_win_export(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    fmt = args.format_win
+    text = app.window.export_window_templates(actor=app.actor, fmt=fmt)
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            if not text.endswith("\n"):
+                fh.write("\n")
+        _print_json({"ok": True, "output": os.path.abspath(args.output), "format": fmt})
+    else:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+    return 0
+
+
+def cmd_win_import(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    result = app.window.import_window_templates(actor=app.actor, path=args.file)
+    _print_json({"ok": True, **result})
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Release Pass command handlers
+# ---------------------------------------------------------------------------
+
+def cmd_pass_create(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    rp = app.window.create_pass(
+        actor=app.actor,
+        env=args.env,
+        reason=args.reason,
+        affected_switches=args.switch or [],
+        valid_from=args.valid_from,
+        valid_until=args.valid_until,
+        approver=args.approver,
+        description=args.description or "",
+    )
+    _print_json({"ok": True, "pass": rp.to_dict()})
+    return 0
+
+
+def cmd_pass_submit(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    rp = app.window.submit_pass_for_approval(actor=app.actor, pass_id=args.pass_id)
+    _print_json({
+        "ok": True,
+        "pass_id": rp.pass_id,
+        "status": rp.status.value if isinstance(rp.status, ReleasePassStatus) else rp.status,
+        "submitted_at": rp.submitted_at,
+    })
+    return 0
+
+
+def cmd_pass_approve(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    rp = app.window.approve_pass(approver=app.actor, pass_id=args.pass_id)
+    _print_json({
+        "ok": True,
+        "pass_id": rp.pass_id,
+        "status": rp.status.value if isinstance(rp.status, ReleasePassStatus) else rp.status,
+        "approver": rp.approver,
+        "approved_at": rp.approved_at,
+    })
+    return 0
+
+
+def cmd_pass_reject(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    rp = app.window.reject_pass(
+        rejector=app.actor,
+        pass_id=args.pass_id,
+        reason=args.reason,
+    )
+    _print_json({
+        "ok": True,
+        "pass_id": rp.pass_id,
+        "status": rp.status.value if isinstance(rp.status, ReleasePassStatus) else rp.status,
+        "rejected_by": rp.rejected_by,
+        "reject_reason": rp.reject_reason,
+    })
+    return 0
+
+
+def cmd_pass_use(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    rp = app.window.use_pass(
+        actor=app.actor,
+        pass_id=args.pass_id,
+        order_id=args.order_id,
+        current_time=args.at,
+    )
+    _print_json({
+        "ok": True,
+        "pass_id": rp.pass_id,
+        "status": rp.status.value if isinstance(rp.status, ReleasePassStatus) else rp.status,
+        "used_at": rp.used_at,
+        "used_by": rp.used_by,
+        "used_for_order_id": rp.used_for_order_id,
+    })
+    return 0
+
+
+def cmd_pass_cancel(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    rp = app.window.cancel_pass(
+        actor=app.actor,
+        pass_id=args.pass_id,
+        reason=args.reason,
+    )
+    _print_json({
+        "ok": True,
+        "pass_id": rp.pass_id,
+        "status": rp.status.value if isinstance(rp.status, ReleasePassStatus) else rp.status,
+        "cancel_reason": rp.cancel_reason,
+        "cancelled_at": rp.cancelled_at,
+    })
+    return 0
+
+
+def cmd_pass_list(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    statuses: Optional[list[ReleasePassStatus]] = None
+    if args.status:
+        statuses = []
+        for s in args.status:
+            try:
+                statuses.append(ReleasePassStatus(s.upper()))
+            except ValueError:
+                raise ValidationError(
+                    f"未知放行单状态 '{s}'，可选: {[x.value for x in ReleasePassStatus]}"
+                )
+    passes = app.window.list_passes(
+        env=args.env,
+        statuses=statuses,
+        created_by=args.created_by,
+        approver=args.approver,
+    )
+    if args.format == "json":
+        _print_json({
+            "count": len(passes),
+            "passes": [p.to_dict() for p in passes],
+        })
+    else:
+        for p in passes:
+            st = p.status.value if isinstance(p.status, ReleasePassStatus) else p.status
+            switches = ", ".join(p.affected_switches) or "(全部)"
+            print(
+                f"{p.pass_id:<18} {st:<18} {p.env:<10} "
+                f"申请人={p.created_by:<20} 审批人={p.approver:<20} "
+                f"有效期={p.valid_from}~{p.valid_until} "
+                f"影响开关={switches}"
+            )
+    return 0
+
+
+def cmd_pass_show(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    rp = app.window.get_pass(pass_id=args.pass_id)
+    records = app.window.list_pass_records(pass_id=args.pass_id)
+    st = rp.status.value if isinstance(rp.status, ReleasePassStatus) else rp.status
+    if args.format == "json":
+        _print_json({
+            "ok": True,
+            "pass": rp.to_dict(),
+            "records": [r.to_dict() for r in records],
+        })
+    else:
+        print(f"=== 临时放行单 {rp.pass_id} ===")
+        print(f"  状态        : {st}")
+        print(f"  环境        : {rp.env}")
+        print(f"  申请人      : {rp.created_by}")
+        print(f"  审批人      : {rp.approver}")
+        print(f"  创建时间    : {rp.created_at}")
+        if rp.submitted_at:
+            print(f"  提交时间    : {rp.submitted_at}")
+        if rp.approved_at:
+            print(f"  审批通过时间: {rp.approved_at}")
+        if rp.rejected_at:
+            print(f"  驳回时间    : {rp.rejected_at} 原因={rp.reject_reason}")
+        if rp.cancelled_at:
+            print(f"  撤销时间    : {rp.cancelled_at} 原因={rp.cancel_reason}")
+        if rp.used_at:
+            print(f"  使用时间    : {rp.used_at} 执行人={rp.used_by} 发布单={rp.used_for_order_id}")
+        print(f"  有效期      : {rp.valid_from} ~ {rp.valid_until}")
+        print(f"  申请原因    : {rp.reason}")
+        if rp.description:
+            print(f"  详细说明    : {rp.description}")
+        print(f"  影响开关 ({len(rp.affected_switches)}): {', '.join(rp.affected_switches) or '(全部)'}")
+        print(f"  校验和      : {rp.checksum}")
+        print(f"  操作记录 ({len(records)}):")
+        for r in records:
+            print(f"    {r.timestamp} {r.action:<22} {r.actor:<20} {r.details[:80]}")
+    return 0
+
+
+def cmd_pass_records(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    records = app.window.list_pass_records(pass_id=args.pass_id, limit=args.limit)
+    if args.format == "json":
+        _print_json({
+            "count": len(records),
+            "records": [r.to_dict() for r in records],
+        })
+    else:
+        for r in records:
+            print(
+                f"{r.timestamp} {r.action:<22} {r.actor:<20} "
+                f"env={r.env:<10} {r.details[:80]}"
+            )
+    return 0
+
+
+def cmd_pass_export(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    fmt = args.format_pass
+    text = app.window.export_passes(
+        actor=app.actor,
+        pass_ids=[args.pass_id] if args.pass_id else None,
+        fmt=fmt,
+    )
+    if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+        with open(args.output, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            if not text.endswith("\n"):
+                fh.write("\n")
+        _print_json({
+            "ok": True,
+            "output": os.path.abspath(args.output),
+            "format": fmt,
+        })
+    else:
+        sys.stdout.write(text)
+        if not text.endswith("\n"):
+            sys.stdout.write("\n")
+    return 0
+
+
+def cmd_pass_import(args: argparse.Namespace, app: AppContext) -> Optional[int]:
+    result = app.window.import_passes(actor=app.actor, path=args.file)
+    _print_json({"ok": True, **result})
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
@@ -1208,6 +1583,137 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=100, help="返回条目上限")
     p.set_defaults(func=cmd_rel_records)
 
+    # win-create
+    p = sub.add_parser("win-create", help="创建发布窗口模板（仅管理员）")
+    p.add_argument("--env", required=True, help="环境 (如 prod / staging)")
+    p.add_argument("--time-range", nargs="+", required=True, dest="time_range",
+                   help="允许时段，格式 HH:MM:HH:MM[:days]，如 09:00:18:00 或 09:00:18:00:monday-friday")
+    p.add_argument("--freeze-day", nargs="*", default=None, dest="freeze_day",
+                   help="冻结日，格式 YYYY-MM-DD")
+    p.add_argument("--approver", nargs="*", default=None, dest="approver",
+                   help="值班审批人邮箱")
+    p.add_argument("--description", default=None, help="默认说明")
+    p.set_defaults(func=cmd_win_create)
+
+    # win-update
+    p = sub.add_parser("win-update", help="更新发布窗口模板（仅管理员）")
+    p.add_argument("--env", required=True, help="环境")
+    p.add_argument("--time-range", nargs="*", default=None, dest="time_range",
+                   help="覆盖允许时段，格式 HH:MM:HH:MM[:days]")
+    p.add_argument("--freeze-day", nargs="*", default=None, dest="freeze_day",
+                   help="覆盖冻结日列表")
+    p.add_argument("--approver", nargs="*", default=None, dest="approver",
+                   help="覆盖值班审批人列表")
+    p.add_argument("--description", default=None, help="更新默认说明")
+    p.set_defaults(func=cmd_win_update)
+
+    # win-delete
+    p = sub.add_parser("win-delete", help="删除发布窗口模板（仅管理员）")
+    p.add_argument("--env", required=True, help="环境")
+    p.set_defaults(func=cmd_win_delete)
+
+    # win-list
+    p = sub.add_parser("win-list", help="列出所有发布窗口模板")
+    p.set_defaults(func=cmd_win_list)
+
+    # win-show
+    p = sub.add_parser("win-show", help="查看某环境的发布窗口模板详情")
+    p.add_argument("--env", required=True, help="环境")
+    p.set_defaults(func=cmd_win_show)
+
+    # win-check
+    p = sub.add_parser("win-check", help="校验当前时间是否在发布窗口内")
+    p.add_argument("--env", required=True, help="环境")
+    p.add_argument("--at", default=None, help="指定校验时间 (ISO 格式，默认当前时间)")
+    p.set_defaults(func=cmd_win_check)
+
+    # win-export
+    p = sub.add_parser("win-export", help="导出所有窗口模板为 YAML/JSON")
+    p.add_argument("--format", choices=["yaml", "json"], default="yaml", dest="format_win",
+                   help="导出格式 (默认 yaml)")
+    p.add_argument("-o", "--output", default=None, help="输出文件路径")
+    p.set_defaults(func=cmd_win_export)
+
+    # win-import
+    p = sub.add_parser("win-import", help="从 YAML/JSON 导入窗口模板（仅管理员）")
+    p.add_argument("--file", required=True, help="导入文件路径")
+    p.set_defaults(func=cmd_win_import)
+
+    # pass-create
+    p = sub.add_parser("pass-create", help="创建临时放行单（草稿）")
+    p.add_argument("--env", required=True, help="环境")
+    p.add_argument("--reason", required=True, help="放行原因")
+    p.add_argument("--switch", nargs="*", default=None, help="影响的开关名（不指定则为全部）")
+    p.add_argument("--valid-from", required=True, dest="valid_from",
+                   help="生效开始时间 (ISO 格式)")
+    p.add_argument("--valid-until", required=True, dest="valid_until",
+                   help="生效截止时间 (ISO 格式)")
+    p.add_argument("--approver", required=True, help="审批人邮箱")
+    p.add_argument("--description", default=None, help="详细说明")
+    p.set_defaults(func=cmd_pass_create)
+
+    # pass-submit
+    p = sub.add_parser("pass-submit", help="提交放行单审批：DRAFT -> PENDING_APPROVAL")
+    p.add_argument("--pass-id", required=True, dest="pass_id", help="放行单 ID")
+    p.set_defaults(func=cmd_pass_submit)
+
+    # pass-approve
+    p = sub.add_parser("pass-approve", help="审批通过放行单（自审拦截）")
+    p.add_argument("--pass-id", required=True, dest="pass_id", help="放行单 ID")
+    p.set_defaults(func=cmd_pass_approve)
+
+    # pass-reject
+    p = sub.add_parser("pass-reject", help="驳回放行单")
+    p.add_argument("--pass-id", required=True, dest="pass_id", help="放行单 ID")
+    p.add_argument("--reason", required=True, help="驳回原因")
+    p.set_defaults(func=cmd_pass_reject)
+
+    # pass-use
+    p = sub.add_parser("pass-use", help="使用放行单（一次性，状态变 USED）")
+    p.add_argument("--pass-id", required=True, dest="pass_id", help="放行单 ID")
+    p.add_argument("--order-id", required=True, dest="order_id", help="关联的发布单 ID")
+    p.add_argument("--at", default=None, help="指定使用时间 (ISO 格式，默认当前时间)")
+    p.set_defaults(func=cmd_pass_use)
+
+    # pass-cancel
+    p = sub.add_parser("pass-cancel", help="撤销未生效的放行单")
+    p.add_argument("--pass-id", required=True, dest="pass_id", help="放行单 ID")
+    p.add_argument("--reason", required=True, help="撤销原因")
+    p.set_defaults(func=cmd_pass_cancel)
+
+    # pass-list
+    p = sub.add_parser("pass-list", help="列出放行单（可按状态/环境/申请人/审批人过滤）")
+    p.add_argument("--env", default=None, help="按环境过滤")
+    p.add_argument("--status", nargs="*", default=None,
+                   help="按状态过滤，如 DRAFT PENDING_APPROVAL APPROVED USED REJECTED CANCELLED EXPIRED")
+    p.add_argument("--created-by", default=None, dest="created_by", help="按申请人过滤")
+    p.add_argument("--approver", default=None, help="按审批人过滤")
+    p.set_defaults(func=cmd_pass_list)
+
+    # pass-show
+    p = sub.add_parser("pass-show", help="查看放行单详情 + 操作记录链")
+    p.add_argument("--pass-id", required=True, dest="pass_id", help="放行单 ID")
+    p.set_defaults(func=cmd_pass_show)
+
+    # pass-records
+    p = sub.add_parser("pass-records", help="查看某放行单的完整操作记录链（审计）")
+    p.add_argument("--pass-id", required=True, dest="pass_id", help="放行单 ID")
+    p.add_argument("--limit", type=int, default=100, help="返回条目上限")
+    p.set_defaults(func=cmd_pass_records)
+
+    # pass-export
+    p = sub.add_parser("pass-export", help="导出行单为 YAML/JSON")
+    p.add_argument("--pass-id", default=None, dest="pass_id", help="指定放行单 ID（不指定则导出全部）")
+    p.add_argument("--format", choices=["yaml", "json"], default="yaml", dest="format_pass",
+                   help="导出格式 (默认 yaml)")
+    p.add_argument("-o", "--output", default=None, help="输出文件路径")
+    p.set_defaults(func=cmd_pass_export)
+
+    # pass-import
+    p = sub.add_parser("pass-import", help="从 YAML/JSON 导出行单")
+    p.add_argument("--file", required=True, help="导入文件路径")
+    p.set_defaults(func=cmd_pass_import)
+
     return parser
 
 
@@ -1221,6 +1727,10 @@ def cli(argv: Optional[list[str]] = None) -> int:
         args.format = args.format_pkg
     if hasattr(args, "format_rel"):
         args.format = args.format_rel
+    if hasattr(args, "format_win"):
+        args.format = args.format_win
+    if hasattr(args, "format_pass"):
+        args.format = args.format_pass
 
     app = build_app(db_path=args.db, actor=args.actor)
     try:

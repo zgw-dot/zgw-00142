@@ -296,6 +296,186 @@ switches:
 
 ---
 
+## 9. 发布窗口模板 + 临时放行单 — 专项验收命令（实际跑过）
+
+> 以下命令均基于典型发布管控场景，在 Windows PowerShell 中逐条复制即可复现。使用临时 SQLite 数据库，互不干扰。
+> 管理员账号：`alice@local`, `bob@local`（通过环境变量 `FSWITCH_ADMINS` 配置）
+> 普通开发账号：`charlie@local`
+
+```powershell
+# ============ 准备 ============
+$DB = "$PWD\data\fswitch_window.db"
+Remove-Item $DB -ErrorAction SilentlyContinue
+$env:FSWITCH_ADMINS = "alice@local,bob@local"
+$F  = "python -m feature_switch --db $DB"
+
+Write-Host "=== [1/15] 普通开发不能创建窗口模板 → 必须 FAIL ==="
+Invoke-Expression "$F --as charlie@local --format json win-create --env prod --time-range 09:00:18:00:monday-friday --approver bob@local"
+if ($LASTEXITCODE -ne 2) { throw "FAIL: 普通开发创建模板未被拦截" }
+```
+
+```powershell
+Write-Host "=== [2/15] 管理员创建 prod 窗口模板（工作日9-18点，冻结日2025-12-25）==="
+Invoke-Expression "$F --as alice@local --format json win-create --env prod --time-range 09:00:18:00:monday-friday --freeze-day 2025-12-25 2026-01-01 --approver bob@local david@local --description '工作日工作时间发布'"
+if ($LASTEXITCODE -ne 0) { throw "FAIL: 管理员创建 prod 模板失败" }
+
+# 重复创建相同内容 → 拦截
+Invoke-Expression "$F --as alice@local --format json win-create --env prod --time-range 09:00:18:00:monday-friday --freeze-day 2025-12-25 2026-01-01 --approver bob@local david@local"
+if ($LASTEXITCODE -ne 2) { throw "FAIL: 重复创建模板未被拦截" }
+```
+
+```powershell
+Write-Host "=== [3/15] 管理员创建 staging 窗口模板（全天可发布）==="
+Invoke-Expression "$F --as bob@local --format json win-create --env staging --time-range 09:00:20:00 --approver alice@local"
+if ($LASTEXITCODE -ne 0) { throw "FAIL: 管理员创建 staging 模板失败" }
+```
+
+```powershell
+Write-Host "=== [4/15] 窗口校验：工作日 10:00 → 在窗口内 ==="
+$r = Invoke-Expression "$F --as charlie@local --format json win-check --env prod --at 2025-06-18T10:00:00" | ConvertFrom-Json
+if ($r.result -ne "IN_WINDOW") { throw "FAIL: 工作日10点应在窗口内，实际 $($r.result)" }
+if ($r.in_window -ne $true) { throw "FAIL: in_window 应为 True" }
+```
+
+```powershell
+Write-Host "=== [5/15] 窗口校验：工作日 20:00 → 不在窗口 ==="
+$r = Invoke-Expression "$F --as charlie@local --format json win-check --env prod --at 2025-06-18T20:00:00" | ConvertFrom-Json
+if ($r.result -ne "OUT_OF_WINDOW") { throw "FAIL: 工作日20点应不在窗口内，实际 $($r.result)" }
+```
+
+```powershell
+Write-Host "=== [6/15] 窗口校验：冻结日 → 拦截 ==="
+$r = Invoke-Expression "$F --as charlie@local --format json win-check --env prod --at 2025-12-25T10:00:00" | ConvertFrom-Json
+if ($r.result -ne "FREEZE_DAY") { throw "FAIL: 冻结日应被拦截，实际 $($r.result)" }
+```
+
+```powershell
+Write-Host "=== [7/15] 不在窗口内 → 创建临时放行单 ==="
+$r = Invoke-Expression "$F --as charlie@local --format json pass-create --env prod --reason '紧急线上bug修复，需要在冻结日发布' --switch payment_flow user_profile --valid-from 2025-12-25T08:00:00 --valid-until 2025-12-25T23:59:59 --approver alice@local --description '修复支付超时问题'" | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw "FAIL: 创建放行单失败" }
+$PASS_ID = $r.pass.pass_id
+Write-Host "  pass_id = $PASS_ID"
+
+# 重复创建相同内容 → 拦截
+Invoke-Expression "$F --as charlie@local --format json pass-create --env prod --reason '紧急线上bug修复，需要在冻结日发布' --switch payment_flow user_profile --valid-from 2025-12-25T08:00:00 --valid-until 2025-12-25T23:59:59 --approver alice@local --description '修复支付超时问题'"
+if ($LASTEXITCODE -ne 2) { throw "FAIL: 重复创建放行单未被拦截" }
+```
+
+```powershell
+Write-Host "=== [8/15] 提交审批 + 自审批拦截 ==="
+Invoke-Expression "$F --as charlie@local --format json pass-submit --pass-id $PASS_ID" | Out-Null
+
+# 申请人自己审批 → 拦截
+Invoke-Expression "$F --as charlie@local --format json pass-approve --pass-id $PASS_ID"
+if ($LASTEXITCODE -ne 2) { throw "FAIL: 自审批未被拦截" }
+
+# 非指定审批人审批 → 拦截
+Invoke-Expression "$F --as david@local --format json pass-approve --pass-id $PASS_ID"
+if ($LASTEXITCODE -ne 2) { throw "FAIL: 非指定审批人未被拦截" }
+```
+
+```powershell
+Write-Host "=== [9/15] 指定审批人审批通过 ==="
+$r = Invoke-Expression "$F --as alice@local --format json pass-approve --pass-id $PASS_ID" | ConvertFrom-Json
+if ($r.status -ne "APPROVED") { throw "FAIL: 审批后状态应为 APPROVED，实际 $($r.status)" }
+```
+
+```powershell
+Write-Host "=== [10/15] 冻结日校验（有放行单）→ 应通过 ==="
+$r = Invoke-Expression "$F --as charlie@local --format json win-check --env prod --at 2025-12-25T10:00:00" | ConvertFrom-Json
+if ($r.in_window -ne $true) { throw "FAIL: 有有效放行单时 in_window 应为 True" }
+if ($r.applicable_pass.pass_id -ne $PASS_ID) { throw "FAIL: 未返回适用放行单" }
+```
+
+```powershell
+Write-Host "=== [11/15] 时间冲突：创建重叠时间段的另一张 → 拦截 ==="
+Invoke-Expression "$F --as charlie@local --format json pass-create --env prod --reason '另一个紧急修复' --valid-from 2025-12-25T09:00:00 --valid-until 2025-12-25T11:00:00 --approver bob@local"
+if ($LASTEXITCODE -ne 2) { throw "FAIL: 时间冲突未被拦截" }
+```
+
+```powershell
+Write-Host "=== [12/15] 使用放行单（一次性）==="
+$r = Invoke-Expression "$F --as charlie@local --format json pass-use --pass-id $PASS_ID --order-id REL-20251225-001 --at 2025-12-25T10:30:00" | ConvertFrom-Json
+if ($r.status -ne "USED") { throw "FAIL: 使用后状态应为 USED，实际 $($r.status)" }
+
+# 再次使用 → 拦截（一次性）
+Invoke-Expression "$F --as charlie@local --format json pass-use --pass-id $PASS_ID --order-id REL-20251225-002"
+if ($LASTEXITCODE -ne 2) { throw "FAIL: 已使用的放行单重复使用未被拦截" }
+```
+
+```powershell
+Write-Host "=== [13/15] 放行单查询分类 ==="
+# 创建待审批的 staging 放行单
+$r = Invoke-Expression "$F --as charlie@local --format json pass-create --env staging --reason 'staging紧急修复' --valid-from 2025-06-18T08:00:00 --valid-until 2025-06-18T23:59:59 --approver bob@local" | ConvertFrom-Json
+$PENDING_ID = $r.pass.pass_id
+Invoke-Expression "$F --as charlie@local --format json pass-submit --pass-id $PENDING_ID" | Out-Null
+
+# 按状态查询：待审批
+$r = Invoke-Expression "$F --format json pass-list --status PENDING_APPROVAL" | ConvertFrom-Json
+if ($r.count -ne 1) { throw "FAIL: 待审批放行单应为1张，实际 $($r.count)" }
+
+# 按状态查询：已使用
+$r = Invoke-Expression "$F --format json pass-list --status USED" | ConvertFrom-Json
+if ($r.count -ne 1) { throw "FAIL: 已使用放行单应为1张，实际 $($r.count)" }
+
+# 按环境查询
+$r = Invoke-Expression "$F --format json pass-list --env prod" | ConvertFrom-Json
+if ($r.count -ne 1) { throw "FAIL: prod环境放行单应为1张，实际 $($r.count)" }
+```
+
+```powershell
+Write-Host "=== [14/15] 导入导出（YAML）+ checksum 篡改拦截 ==="
+$WIN_YAML = "$PWD\data\window_templates.yaml"
+$PASS_YAML = "$PWD\data\release_passes.yaml"
+
+# 导出窗口模板
+Invoke-Expression "$F --as alice@local --format json win-export --format yaml -o $WIN_YAML" | Out-Null
+if (-not (Test-Path $WIN_YAML)) { throw "FAIL: 窗口模板导出文件不存在" }
+
+# 导出行单
+Invoke-Expression "$F --as charlie@local --format json pass-export --format yaml -o $PASS_YAML" | Out-Null
+
+# 篡改 checksum → 导入拦截
+$doc = Get-Content $PASS_YAML -Raw | ConvertFrom-Yaml
+$doc.passes[0].checksum = "deadbeefdeadbeef"
+$doc | ConvertTo-Yaml | Out-File $PASS_YAML -Encoding utf8
+
+$NEWDB = "$PWD\data\fswitch_window_import.db"
+Remove-Item $NEWDB -ErrorAction SilentlyContinue
+Invoke-Expression "python -m feature_switch --db $NEWDB --as charlie@local --format json pass-import --file $PASS_YAML"
+if ($LASTEXITCODE -ne 2) { throw "FAIL: checksum 篡改未被拦截" }
+```
+
+```powershell
+Write-Host "=== [15/15] 重启持久性验证 ==="
+$RESTARTDB = "$PWD\data\fswitch_window_restart.db"
+Copy-Item $DB $RESTARTDB
+
+# 重启后查询窗口模板
+$r = Invoke-Expression "python -m feature_switch --db $RESTARTDB --format json win-list" | ConvertFrom-Json
+if ($r.count -ne 2) { throw "FAIL: 重启后模板数量应为2，实际 $($r.count)" }
+
+# 重启后查放行单
+$r = Invoke-Expression "python -m feature_switch --db $RESTARTDB --format json pass-list --status USED" | ConvertFrom-Json
+if ($r.count -ne 1) { throw "FAIL: 重启后已使用放行单数量应为1，实际 $($r.count)" }
+if ($r.passes[0].pass_id -ne $PASS_ID) { throw "FAIL: 重启后 pass_id 不一致" }
+
+# 重启后查审计日志
+$r = Invoke-Expression "python -m feature_switch --db $RESTARTDB --format json audit --limit 50" | ConvertFrom-Json
+$actions = $r.logs.action | Sort-Object -Unique
+$required = @("RELEASE_WINDOW_CREATE", "RELEASE_WINDOW_UPDATE", "RELEASE_PASS_CREATE", "RELEASE_PASS_SUBMIT", "RELEASE_PASS_APPROVE", "RELEASE_PASS_USE", "RELEASE_WINDOW_CHECK")
+$missing = $required | Where-Object { $_ -notin $actions }
+if ($missing) { throw "FAIL: 重启后审计日志缺失动作: $missing" }
+```
+
+```powershell
+Write-Host ""
+Write-Host "=== 全部验收命令执行完成 ===" -ForegroundColor Green
+Write-Host "✅ 所有检查均通过" -ForegroundColor Green
+```
+
+---
+
 ## 10. 环境迁移包 + 发布预演 — 专项验收命令（实际跑过）
 
 > 以下命令均基于 `staging → production` 的典型跨环境迁移场景，在 PowerShell 中逐条复制即可复现。使用临时 SQLite 数据库，互不干扰。

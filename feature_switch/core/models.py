@@ -4,7 +4,15 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any, Optional
 
-from .enums import VersionStatus, AuditAction, MigrationStatus, ChangeType, ReleaseOrderStatus
+from .enums import (
+    VersionStatus,
+    AuditAction,
+    MigrationStatus,
+    ChangeType,
+    ReleaseOrderStatus,
+    ReleasePassStatus,
+    WindowCheckResult,
+)
 
 
 def _now_iso() -> str:
@@ -660,5 +668,242 @@ class ReleaseOrderRecord:
             version=row.get("version"),
             details=row.get("details") or "",
             rollback_source_order_id=row.get("rollback_source_order_id"),
+            timestamp=row.get("timestamp") or _now_iso(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Release Window models (发布窗口模板)
+# ---------------------------------------------------------------------------
+
+_RELEASE_WINDOW_SCHEMA_VERSION = "1.0"
+
+
+@dataclass
+class ReleaseWindowTemplate:
+    """发布窗口模板：定义某个环境的可发布时间段、冻结日等。"""
+    env: str
+    allowed_time_ranges: list[dict[str, str]]
+    freeze_days: list[str]
+    on_call_approvers: list[str]
+    default_description: str = ""
+    id: Optional[int] = None
+    created_by: str = ""
+    updated_by: Optional[str] = None
+    created_at: str = field(default_factory=_now_iso)
+    updated_at: Optional[str] = None
+    checksum: str = ""
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        return data
+
+    def to_export_dict(self) -> dict:
+        return {
+            "schema_version": _RELEASE_WINDOW_SCHEMA_VERSION,
+            "env": self.env,
+            "allowed_time_ranges": [dict(r) for r in self.allowed_time_ranges],
+            "freeze_days": list(self.freeze_days),
+            "on_call_approvers": list(self.on_call_approvers),
+            "default_description": self.default_description,
+            "created_by": self.created_by,
+            "created_at": self.created_at,
+            "checksum": self.checksum,
+        }
+
+    @classmethod
+    def from_row(cls, row: dict) -> "ReleaseWindowTemplate":
+        import json
+
+        def _pl(raw: Any) -> list[str]:
+            if raw is None:
+                return []
+            if isinstance(raw, list):
+                return list(raw)
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    return list(parsed) if isinstance(parsed, list) else []
+                except (json.JSONDecodeError, TypeError):
+                    return []
+            return []
+
+        def _pl_dict(raw: Any) -> list[dict[str, str]]:
+            if raw is None:
+                return []
+            if isinstance(raw, list):
+                return [dict(r) for r in raw]
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    return [dict(r) for r in parsed] if isinstance(parsed, list) else []
+                except (json.JSONDecodeError, TypeError):
+                    return []
+            return []
+
+        return cls(
+            id=row.get("id"),
+            env=row["env"],
+            allowed_time_ranges=_pl_dict(row.get("allowed_time_ranges")),
+            freeze_days=_pl(row.get("freeze_days")),
+            on_call_approvers=_pl(row.get("on_call_approvers")),
+            default_description=row.get("default_description") or "",
+            created_by=row.get("created_by") or "",
+            updated_by=row.get("updated_by"),
+            created_at=row.get("created_at") or _now_iso(),
+            updated_at=row.get("updated_at"),
+            checksum=row.get("checksum") or "",
+        )
+
+
+@dataclass
+class WindowCheckResponse:
+    """窗口校验结果。"""
+    env: str
+    result: WindowCheckResult
+    in_window: bool
+    message: str
+    current_time: str
+    template: Optional[ReleaseWindowTemplate] = None
+    applicable_pass: Optional["ReleasePass"] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "env": self.env,
+            "result": self.result.value if isinstance(self.result, WindowCheckResult) else self.result,
+            "in_window": self.in_window,
+            "message": self.message,
+            "current_time": self.current_time,
+            "template": self.template.to_export_dict() if self.template else None,
+            "applicable_pass": self.applicable_pass.to_dict() if self.applicable_pass else None,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Release Pass models (临时放行单)
+# ---------------------------------------------------------------------------
+
+_RELEASE_PASS_SCHEMA_VERSION = "1.0"
+
+
+@dataclass
+class ReleasePass:
+    """临时放行单：不在发布窗口时需要申请的特殊审批单。"""
+    pass_id: str
+    env: str
+    created_by: str
+    reason: str
+    affected_switches: list[str]
+    valid_from: str
+    valid_until: str
+    approver: str
+    status: ReleasePassStatus = ReleasePassStatus.DRAFT
+    id: Optional[int] = None
+    used_at: Optional[str] = None
+    used_by: Optional[str] = None
+    used_for_order_id: Optional[str] = None
+    rejected_by: Optional[str] = None
+    reject_reason: Optional[str] = None
+    cancel_reason: Optional[str] = None
+    description: str = ""
+    checksum: str = ""
+    created_at: str = field(default_factory=_now_iso)
+    submitted_at: Optional[str] = None
+    approved_at: Optional[str] = None
+    rejected_at: Optional[str] = None
+    cancelled_at: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["status"] = self.status.value if isinstance(self.status, ReleasePassStatus) else self.status
+        return data
+
+    def to_export_dict(self) -> dict:
+        return {
+            "schema_version": _RELEASE_PASS_SCHEMA_VERSION,
+            "pass_id": self.pass_id,
+            "env": self.env,
+            "created_by": self.created_by,
+            "reason": self.reason,
+            "affected_switches": list(self.affected_switches),
+            "valid_from": self.valid_from,
+            "valid_until": self.valid_until,
+            "approver": self.approver,
+            "status": self.status.value if isinstance(self.status, ReleasePassStatus) else self.status,
+            "description": self.description,
+            "checksum": self.checksum,
+            "created_at": self.created_at,
+            "submitted_at": self.submitted_at,
+            "approved_at": self.approved_at,
+        }
+
+    @classmethod
+    def from_row(cls, row: dict) -> "ReleasePass":
+        import json
+
+        def _pl(raw: Any) -> list[str]:
+            if raw is None:
+                return []
+            if isinstance(raw, list):
+                return list(raw)
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                    return list(parsed) if isinstance(parsed, list) else []
+                except (json.JSONDecodeError, TypeError):
+                    return []
+            return []
+
+        status = row["status"] if isinstance(row["status"], ReleasePassStatus) else ReleasePassStatus(row["status"])
+        return cls(
+            id=row.get("id"),
+            pass_id=row["pass_id"],
+            env=row["env"],
+            created_by=row["created_by"],
+            reason=row["reason"],
+            affected_switches=_pl(row.get("affected_switches")),
+            valid_from=row["valid_from"],
+            valid_until=row["valid_until"],
+            approver=row["approver"],
+            status=status,
+            used_at=row.get("used_at"),
+            used_by=row.get("used_by"),
+            used_for_order_id=row.get("used_for_order_id"),
+            rejected_by=row.get("rejected_by"),
+            reject_reason=row.get("reject_reason"),
+            cancel_reason=row.get("cancel_reason"),
+            description=row.get("description") or "",
+            checksum=row.get("checksum") or "",
+            created_at=row.get("created_at") or _now_iso(),
+            submitted_at=row.get("submitted_at"),
+            approved_at=row.get("approved_at"),
+            rejected_at=row.get("rejected_at"),
+            cancelled_at=row.get("cancelled_at"),
+        )
+
+
+@dataclass
+class ReleasePassRecord:
+    """放行单操作记录（审计链）。"""
+    pass_id: str
+    action: str
+    actor: str
+    env: str
+    id: Optional[int] = None
+    details: str = ""
+    timestamp: str = field(default_factory=_now_iso)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_row(cls, row: dict) -> "ReleasePassRecord":
+        return cls(
+            id=row.get("id"),
+            pass_id=row["pass_id"],
+            action=row["action"],
+            actor=row["actor"],
+            env=row["env"],
+            details=row.get("details") or "",
             timestamp=row.get("timestamp") or _now_iso(),
         )

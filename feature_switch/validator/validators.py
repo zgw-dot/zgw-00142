@@ -3,7 +3,14 @@ from __future__ import annotations
 import json
 from typing import Any, Optional, TYPE_CHECKING
 
-from ..core.enums import VersionStatus, VALID_TRANSITIONS, ReleaseOrderStatus, VALID_RELEASE_TRANSITIONS
+from ..core.enums import (
+    VersionStatus,
+    VALID_TRANSITIONS,
+    ReleaseOrderStatus,
+    VALID_RELEASE_TRANSITIONS,
+    ReleasePassStatus,
+    VALID_RELEASE_PASS_TRANSITIONS,
+)
 
 if TYPE_CHECKING:
     from ..storage.repository import SwitchRepository
@@ -458,4 +465,163 @@ def validate_release_payload(data: Any) -> dict[str, Any]:
         "title": (data.get("title") or "").strip(),
         "description": (data.get("description") or "").strip(),
         "items": item_dicts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Release Window validations
+# ---------------------------------------------------------------------------
+
+def validate_time_range_format(time_range: dict[str, str]) -> None:
+    """Validate time range format: {"start": "HH:MM", "end": "HH:MM"}."""
+    if not isinstance(time_range, dict):
+        raise ValidationError("时间段必须是对象", field="allowed_time_ranges")
+    if "start" not in time_range or "end" not in time_range:
+        raise ValidationError(
+            "时间段必须包含 start 和 end 字段", field="allowed_time_ranges")
+    start = time_range["start"]
+    end = time_range["end"]
+    if not isinstance(start, str) or not isinstance(end, str):
+        raise ValidationError("时间段的 start 和 end 必须是字符串", field="allowed_time_ranges")
+    import re
+    time_pattern = r"^\d{2}:\d{2}$"
+    if not re.match(time_pattern, start):
+        raise ValidationError(f"时间段 start 格式错误，应为 HH:MM", field="allowed_time_ranges")
+    if not re.match(time_pattern, end):
+        raise ValidationError(f"时间段 end 格式错误，应为 HH:MM", field="allowed_time_ranges")
+
+
+def validate_freeze_day_format(day: str) -> None:
+    """Validate freeze day format: YYYY-MM-DD."""
+    if not isinstance(day, str):
+        raise ValidationError("冻结日必须是字符串", field="freeze_days")
+    import re
+    day_pattern = r"^\d{4}-\d{2}-\d{2}$"
+    if not re.match(day_pattern, day):
+        raise ValidationError(f"冻结日格式错误，应为 YYYY-MM-DD", field="freeze_days")
+
+
+def validate_iso_datetime(dt: str, field: str) -> None:
+    """Validate ISO datetime format: YYYY-MM-DDTHH:MM:SS."""
+    if not isinstance(dt, str):
+        raise ValidationError(f"{field} 必须是字符串", field=field)
+    import re
+    dt_pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$"
+    if not re.match(dt_pattern, dt):
+        raise ValidationError(f"{field} 格式错误，应为 YYYY-MM-DDTHH:MM:SS", field=field)
+
+
+def validate_release_window_payload(data: Any) -> dict[str, Any]:
+    """Validate release window template payload."""
+    if not isinstance(data, dict):
+        raise ValidationError(f"窗口模板配置必须是对象/mapping，收到 {type(data).__name__}")
+
+    required = ("env", "allowed_time_ranges", "freeze_days", "on_call_approvers")
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise ValidationError(f"缺少必填字段: {missing}")
+
+    env = data["env"]
+    allowed_time_ranges = data["allowed_time_ranges"]
+    freeze_days = data["freeze_days"]
+    on_call_approvers = data["on_call_approvers"]
+
+    if not isinstance(env, str) or not env.strip():
+        raise ValidationError("env 必须是非空字符串", field="env")
+
+    if not isinstance(allowed_time_ranges, list):
+        raise ValidationError("allowed_time_ranges 必须是列表", field="allowed_time_ranges")
+
+    for idx, tr in enumerate(allowed_time_ranges):
+        validate_time_range_format(tr)
+
+    if not isinstance(freeze_days, list):
+        raise ValidationError("freeze_days 必须是列表", field="freeze_days")
+
+    for idx, day in enumerate(freeze_days):
+        validate_freeze_day_format(day)
+
+    if not isinstance(on_call_approvers, list) or not on_call_approvers:
+        raise ValidationError("on_call_approvers 必须是非空列表", field="on_call_approvers")
+
+    for idx, approver in enumerate(on_call_approvers):
+        if not isinstance(approver, str) or not approver.strip():
+            raise ValidationError(f"on_call_approvers[{idx}] 必须是非空字符串", field="on_call_approvers")
+
+    return {
+        "env": env.strip(),
+        "allowed_time_ranges": [dict(tr) for tr in allowed_time_ranges],
+        "freeze_days": list(freeze_days),
+        "on_call_approvers": list(on_call_approvers),
+        "default_description": (data.get("default_description") or "").strip(),
+    }
+
+
+def validate_release_pass_transition(
+    current: ReleasePassStatus, target: ReleasePassStatus
+) -> None:
+    allowed = VALID_RELEASE_PASS_TRANSITIONS.get(current, [])
+    if target not in allowed:
+        raise ValidationError(
+            f"放行单不允许的状态流转: {current.value} -> {target.value}。"
+            f"允许的目标状态: {[s.value for s in allowed] or '(无)'}",
+            field="status",
+        )
+
+
+def validate_release_pass_not_self_approve(created_by: str, approver: str) -> None:
+    if created_by == approver:
+        raise ValidationError(
+            f"放行单创建人 '{created_by}' 不能审批自己的放行单，必须由其他人审批",
+            field="approver",
+        )
+
+
+def validate_release_pass_payload(data: Any) -> dict[str, Any]:
+    """Validate release pass payload."""
+    if not isinstance(data, dict):
+        raise ValidationError(f"放行单配置必须是对象/mapping，收到 {type(data).__name__}")
+
+    required = ("env", "reason", "affected_switches", "valid_from", "valid_until", "approver")
+    missing = [k for k in required if k not in data]
+    if missing:
+        raise ValidationError(f"缺少必填字段: {missing}")
+
+    env = data["env"]
+    reason = data["reason"]
+    affected_switches = data["affected_switches"]
+    valid_from = data["valid_from"]
+    valid_until = data["valid_until"]
+    approver = data["approver"]
+
+    if not isinstance(env, str) or not env.strip():
+        raise ValidationError("env 必须是非空字符串", field="env")
+
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValidationError("reason 必须是非空字符串", field="reason")
+
+    if not isinstance(affected_switches, list):
+        raise ValidationError("affected_switches 必须是列表", field="affected_switches")
+
+    for idx, sw in enumerate(affected_switches):
+        if not isinstance(sw, str) or not sw.strip():
+            raise ValidationError(f"affected_switches[{idx}] 必须是非空字符串", field="affected_switches")
+
+    validate_iso_datetime(valid_from, "valid_from")
+    validate_iso_datetime(valid_until, "valid_until")
+
+    if valid_from >= valid_until:
+        raise ValidationError("valid_from 必须早于 valid_until", field="valid_until")
+
+    if not isinstance(approver, str) or not approver.strip():
+        raise ValidationError("approver 必须是非空字符串", field="approver")
+
+    return {
+        "env": env.strip(),
+        "reason": reason.strip(),
+        "affected_switches": list(affected_switches),
+        "valid_from": valid_from,
+        "valid_until": valid_until,
+        "approver": approver.strip(),
+        "description": (data.get("description") or "").strip(),
     }

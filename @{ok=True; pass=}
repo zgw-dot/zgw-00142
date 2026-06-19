@@ -1,0 +1,18 @@
+schema_version: '1.0'
+passes:
+- schema_version: '1.0'
+  pass_id: pass-00fc2f32dde3
+  env: prod
+  created_by: charlie@local
+  reason: freeze hotfix
+  affected_switches:
+  - payment_flow
+  valid_from: '2025-12-25T08:00:00'
+  valid_until: '2025-12-25T23:59:59'
+  approver: alice@local
+  status: USED
+  description: ''
+  checksum: d0e528a8ed45481b
+  created_at: '2026-06-19T18:58:27'
+  submitted_at: '2026-06-19T18:58:28'
+  approved_at: '2026-06-19T18:58:28'

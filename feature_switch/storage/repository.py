@@ -7,7 +7,13 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
-from ..core.enums import VersionStatus, AuditAction, MigrationStatus, ReleaseOrderStatus
+from ..core.enums import (
+    VersionStatus,
+    AuditAction,
+    MigrationStatus,
+    ReleaseOrderStatus,
+    ReleasePassStatus,
+)
 from ..core.models import (
     FeatureSwitch,
     SwitchVersion,
@@ -20,6 +26,11 @@ from ..core.models import (
     ReleaseOrderItem,
     ReleaseOrderRecord,
     _RELEASE_SCHEMA_VERSION,
+    ReleaseWindowTemplate,
+    ReleasePass,
+    ReleasePassRecord,
+    _RELEASE_WINDOW_SCHEMA_VERSION,
+    _RELEASE_PASS_SCHEMA_VERSION,
 )
 
 
@@ -207,6 +218,68 @@ CREATE TABLE IF NOT EXISTS release_order_record (
 
 CREATE INDEX IF NOT EXISTS idx_release_order_record
     ON release_order_record(order_id, timestamp);
+
+-- 发布窗口模板
+CREATE TABLE IF NOT EXISTS release_window_template (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    env                  TEXT NOT NULL UNIQUE,
+    allowed_time_ranges  TEXT NOT NULL DEFAULT '[]',
+    freeze_days          TEXT NOT NULL DEFAULT '[]',
+    on_call_approvers    TEXT NOT NULL DEFAULT '[]',
+    default_description  TEXT NOT NULL DEFAULT '',
+    created_by           TEXT NOT NULL,
+    updated_by           TEXT,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT,
+    checksum             TEXT NOT NULL DEFAULT ''
+);
+
+-- 临时放行单
+CREATE TABLE IF NOT EXISTS release_pass (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    pass_id              TEXT NOT NULL UNIQUE,
+    env                  TEXT NOT NULL,
+    created_by           TEXT NOT NULL,
+    reason               TEXT NOT NULL,
+    affected_switches    TEXT NOT NULL DEFAULT '[]',
+    valid_from           TEXT NOT NULL,
+    valid_until          TEXT NOT NULL,
+    approver             TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'DRAFT',
+    used_at              TEXT,
+    used_by              TEXT,
+    used_for_order_id    TEXT,
+    rejected_by          TEXT,
+    reject_reason        TEXT,
+    cancel_reason        TEXT,
+    description          TEXT NOT NULL DEFAULT '',
+    checksum             TEXT NOT NULL DEFAULT '',
+    created_at           TEXT NOT NULL,
+    submitted_at         TEXT,
+    approved_at          TEXT,
+    rejected_at          TEXT,
+    cancelled_at         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_pass_env
+    ON release_pass(env, status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_release_pass_approver
+    ON release_pass(approver, status);
+
+-- 放行单操作记录（审计链）
+CREATE TABLE IF NOT EXISTS release_pass_record (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    pass_id              TEXT NOT NULL,
+    action               TEXT NOT NULL,
+    actor                TEXT NOT NULL,
+    env                  TEXT NOT NULL,
+    details              TEXT NOT NULL DEFAULT '',
+    timestamp            TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_pass_record
+    ON release_pass_record(pass_id, timestamp);
 """
 
 
@@ -880,3 +953,225 @@ class SwitchRepository:
         params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
         return [ReleaseOrderRecord.from_row(dict(r)) for r in rows]
+
+    # ---------- ReleaseWindowTemplate ----------
+
+    def insert_release_window_template(
+        self, template: ReleaseWindowTemplate, *, conn: Optional[sqlite3.Connection] = None
+    ) -> ReleaseWindowTemplate:
+        c = conn or self._conn
+        cur = c.execute(
+            """
+            INSERT INTO release_window_template(
+                env, allowed_time_ranges, freeze_days, on_call_approvers,
+                default_description, created_by, updated_by, created_at,
+                updated_at, checksum
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                template.env,
+                json.dumps(template.allowed_time_ranges, ensure_ascii=False),
+                json.dumps(template.freeze_days, ensure_ascii=False),
+                json.dumps(template.on_call_approvers, ensure_ascii=False),
+                template.default_description,
+                template.created_by,
+                template.updated_by,
+                template.created_at,
+                template.updated_at,
+                template.checksum,
+            ),
+        )
+        template.id = cur.lastrowid
+        return template
+
+    def update_release_window_template(
+        self,
+        env: str,
+        updates: dict[str, Any],
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        if not updates:
+            return
+        c = conn or self._conn
+        for k in ("allowed_time_ranges", "freeze_days", "on_call_approvers"):
+            if k in updates and updates[k] is not None:
+                updates[k] = json.dumps(updates[k], ensure_ascii=False)
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [env]
+        c.execute(f"UPDATE release_window_template SET {sets} WHERE env = ?", values)
+
+    def get_release_window_template(
+        self, env: str
+    ) -> Optional[ReleaseWindowTemplate]:
+        row = self._conn.execute(
+            "SELECT * FROM release_window_template WHERE env = ?", (env,)
+        ).fetchone()
+        return ReleaseWindowTemplate.from_row(dict(row)) if row else None
+
+    def list_release_window_templates(self) -> list[ReleaseWindowTemplate]:
+        rows = self._conn.execute(
+            "SELECT * FROM release_window_template ORDER BY env"
+        ).fetchall()
+        return [ReleaseWindowTemplate.from_row(dict(r)) for r in rows]
+
+    def delete_release_window_template(
+        self, env: str, *, conn: Optional[sqlite3.Connection] = None
+    ) -> None:
+        c = conn or self._conn
+        c.execute("DELETE FROM release_window_template WHERE env = ?", (env,))
+
+    def find_release_window_by_checksum(
+        self, checksum: str
+    ) -> Optional[ReleaseWindowTemplate]:
+        row = self._conn.execute(
+            "SELECT * FROM release_window_template WHERE checksum = ? ORDER BY id DESC LIMIT 1",
+            (checksum,),
+        ).fetchone()
+        return ReleaseWindowTemplate.from_row(dict(row)) if row else None
+
+    # ---------- ReleasePass ----------
+
+    def insert_release_pass(
+        self, pass_obj: ReleasePass, *, conn: Optional[sqlite3.Connection] = None
+    ) -> ReleasePass:
+        c = conn or self._conn
+        status_val = pass_obj.status.value if isinstance(pass_obj.status, ReleasePassStatus) else pass_obj.status
+        cur = c.execute(
+            """
+            INSERT INTO release_pass(
+                pass_id, env, created_by, reason, affected_switches,
+                valid_from, valid_until, approver, status, used_at,
+                used_by, used_for_order_id, rejected_by, reject_reason,
+                cancel_reason, description, checksum, created_at,
+                submitted_at, approved_at, rejected_at, cancelled_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                pass_obj.pass_id, pass_obj.env, pass_obj.created_by,
+                pass_obj.reason,
+                json.dumps(pass_obj.affected_switches, ensure_ascii=False),
+                pass_obj.valid_from, pass_obj.valid_until, pass_obj.approver,
+                status_val, pass_obj.used_at, pass_obj.used_by,
+                pass_obj.used_for_order_id, pass_obj.rejected_by,
+                pass_obj.reject_reason, pass_obj.cancel_reason,
+                pass_obj.description, pass_obj.checksum, pass_obj.created_at,
+                pass_obj.submitted_at, pass_obj.approved_at,
+                pass_obj.rejected_at, pass_obj.cancelled_at,
+            ),
+        )
+        pass_obj.id = cur.lastrowid
+        return pass_obj
+
+    def update_release_pass_fields(
+        self,
+        pass_id: str,
+        updates: dict[str, Any],
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
+        if not updates:
+            return
+        c = conn or self._conn
+        if "affected_switches" in updates and updates["affected_switches"] is not None:
+            updates["affected_switches"] = json.dumps(updates["affected_switches"], ensure_ascii=False)
+        if "status" in updates and isinstance(updates["status"], ReleasePassStatus):
+            updates["status"] = updates["status"].value
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [pass_id]
+        c.execute(f"UPDATE release_pass SET {sets} WHERE pass_id = ?", values)
+
+    def get_release_pass(self, pass_id: str) -> Optional[ReleasePass]:
+        row = self._conn.execute(
+            "SELECT * FROM release_pass WHERE pass_id = ?", (pass_id,)
+        ).fetchone()
+        return ReleasePass.from_row(dict(row)) if row else None
+
+    def list_release_passes(
+        self,
+        env: Optional[str] = None,
+        statuses: Optional[list[ReleasePassStatus]] = None,
+        approver: Optional[str] = None,
+        created_by: Optional[str] = None,
+    ) -> list[ReleasePass]:
+        sql = "SELECT * FROM release_pass WHERE 1=1"
+        params: list[Any] = []
+        if env:
+            sql += " AND env = ?"
+            params.append(env)
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            sql += f" AND status IN ({placeholders})"
+            params.extend(s.value for s in statuses)
+        if approver:
+            sql += " AND approver = ?"
+            params.append(approver)
+        if created_by:
+            sql += " AND created_by = ?"
+            params.append(created_by)
+        sql += " ORDER BY id DESC"
+        rows = self._conn.execute(sql, params).fetchall()
+        return [ReleasePass.from_row(dict(r)) for r in rows]
+
+    def find_release_pass_by_checksum(
+        self, env: str, checksum: str
+    ) -> Optional[ReleasePass]:
+        row = self._conn.execute(
+            """
+            SELECT * FROM release_pass
+            WHERE env = ? AND checksum = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (env, checksum),
+        ).fetchone()
+        return ReleasePass.from_row(dict(row)) if row else None
+
+    def get_active_approved_pass(
+        self, env: str, current_time: str
+    ) -> Optional[ReleasePass]:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM release_pass
+            WHERE env = ? AND status = 'APPROVED'
+              AND valid_from <= ? AND valid_until >= ?
+              AND used_at IS NULL
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (env, current_time, current_time),
+        ).fetchall()
+        if not rows:
+            return None
+        return ReleasePass.from_row(dict(rows[0]))
+
+    # ---------- ReleasePassRecord ----------
+
+    def append_release_pass_record(
+        self, rec: ReleasePassRecord, *, conn: Optional[sqlite3.Connection] = None
+    ) -> ReleasePassRecord:
+        c = conn or self._conn
+        cur = c.execute(
+            """
+            INSERT INTO release_pass_record(
+                pass_id, action, actor, env, details, timestamp
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                rec.pass_id, rec.action, rec.actor, rec.env,
+                rec.details, rec.timestamp,
+            ),
+        )
+        rec.id = cur.lastrowid
+        return rec
+
+    def list_release_pass_records(
+        self, pass_id: Optional[str] = None, limit: int = 100
+    ) -> list[ReleasePassRecord]:
+        sql = "SELECT * FROM release_pass_record WHERE 1=1"
+        params: list[Any] = []
+        if pass_id:
+            sql += " AND pass_id = ?"
+            params.append(pass_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [ReleasePassRecord.from_row(dict(r)) for r in rows]
